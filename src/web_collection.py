@@ -1,0 +1,2419 @@
+from __future__ import annotations
+import json
+import mimetypes
+import threading
+import webbrowser
+import http.server
+import socketserver
+from pathlib import Path
+from src.models import Card, Collection
+
+_PORT = 8765
+_CDN = "https://limitlesstcg.nyc3.cdn.digitaloceanspaces.com/pocket"
+# Catalog set codes that differ from the CDN's set codes
+_SET_REMAP = {"PROMO-A": "P-A", "PROMO-B": "P-B"}
+
+
+def _card_image_url(card_id: str) -> str:
+    """Return the Limitless CDN image URL for a card ID like 'A1-036' or 'PROMO-A-005'."""
+    parts = card_id.rsplit("-", 1)
+    if len(parts) != 2:
+        return ""
+    set_code, number = parts
+    cdn_set = _SET_REMAP.get(set_code, set_code)
+    return f"{_CDN}/{cdn_set}/{cdn_set}_{number}_EN.webp"
+
+
+def _prepare_page_data(
+    archetypes: list[dict],
+    catalog: dict[str, Card],
+    my_cards: dict,
+    ewrs: list[float],
+    attributions: list[dict],
+    meta_decks: list,
+    custom_decks: list[dict] | None = None,
+    matchup_matrix: dict | None = None,
+    role_map: dict | None = None,
+    regression=None,
+) -> dict:
+    """Prepare all JSON-serialisable data the browser tabs need."""
+    # ── COLLECTION tab ──────────────────────────────────────────────────────
+    decks_data = []
+    for arch in archetypes:
+        cards_data = []
+        for entry in arch.get("cards", []):
+            card = catalog.get(entry["id"])
+            if card is None:
+                continue
+            cards_data.append({
+                "id": entry["id"],
+                "name": card.name,
+                "type": card.card_type,
+                "need": entry["count"],
+                "have": my_cards.get(entry["id"], 0),
+                "img": _card_image_url(entry["id"]),
+                "role": role_map.get(entry["id"], "garnet") if role_map else "garnet",
+            })
+        if cards_data:
+            decks_data.append({
+                "id": arch["id"],
+                "name": arch["name"],
+                "meta_share": arch.get("meta_share", 0),
+                "win_rate": arch.get("win_rate", 0.5),
+                "cards": cards_data,
+                "custom": False,
+            })
+
+    # Append user-created custom decks
+    for cdeck in (custom_decks or []):
+        cards_data = []
+        for entry in cdeck.get("cards", []):
+            card = catalog.get(entry["id"])
+            if card is None:
+                continue
+            cards_data.append({
+                "id": entry["id"],
+                "name": card.name,
+                "type": card.card_type,
+                "need": entry["count"],
+                "have": my_cards.get(entry["id"], 0),
+                "img": _card_image_url(entry["id"]),
+                "role": role_map.get(entry["id"], "garnet") if role_map else "garnet",
+            })
+        if cards_data:
+            decks_data.append({
+                "id": cdeck["id"],
+                "name": cdeck["name"],
+                "meta_share": 0,
+                "win_rate": 0,
+                "cards": cards_data,
+                "custom": True,
+            })
+
+    # ── META tab ─────────────────────────────────────────────────────────────
+    def _hero_img(arch: dict) -> str:
+        """Return CDN image URL for the representative Pokémon of an archetype.
+
+        Priority:
+        1. Pokémon whose name appears in the archetype name (e.g. 'Charizard ex'
+           is in 'Charizard ex / Moltres ex').
+        2. Pokémon with the highest HP (typically the win-condition attacker).
+        3. Any first Pokémon card.
+        4. Any first card at all.
+        """
+        arch_name_lower = arch.get("name", "").lower()
+        best_id: str = ""
+        best_hp: int = -1
+
+        for entry in arch.get("cards", []):
+            card = catalog.get(entry["id"])
+            if not card or not card.is_pokemon:
+                continue
+            # Exact name match inside the archetype label → use immediately
+            if card.name.lower() in arch_name_lower:
+                return _card_image_url(entry["id"])
+            # Track the highest-HP Pokémon as fallback
+            if (card.hp or 0) > best_hp:
+                best_hp = card.hp or 0
+                best_id = entry["id"]
+
+        if best_id:
+            return _card_image_url(best_id)
+
+        # Last resort: first card of any type
+        for entry in arch.get("cards", []):
+            return _card_image_url(entry["id"])
+        return ""
+
+    meta_data = sorted(
+        [
+            {
+                "id": arch["id"],
+                "name": arch["name"],
+                "meta_share": round(arch.get("meta_share", 0) * 100, 1),
+                "win_rate": round(arch.get("win_rate", 0.5) * 100, 1),
+                "ewr": round(ewr * 100, 1),
+                "hero_img": _hero_img(arch),
+            }
+            for arch, ewr in zip(archetypes, ewrs)
+        ],
+        key=lambda x: x["meta_share"],
+        reverse=True,
+    )
+
+    # ── ANALYSIS tab ─────────────────────────────────────────────────────────
+    _ROLES = ["win_condition", "engine", "staple", "tech", "garnet"]
+    collection = Collection(cards=my_cards)
+    analysis_data = []
+    for deck, ewr, attr in zip(meta_decks, ewrs, attributions):
+        completion = collection.completion_percent(deck)
+        missing = collection.missing_cards(deck)
+        top_role = max(attr, key=lambda r: attr[r]) if attr else "N/A"  # noqa: B023
+        analysis_data.append({
+            "name": deck.archetype_label,
+            "completion": completion,
+            "ewr": round(ewr * 100, 1),
+            "top_role": top_role,
+            "attribution": {r: round(attr.get(r, 0) * 100, 2) for r in _ROLES},
+            "predicted_wr": round(
+                (sum(attr.values()) + (regression.intercept if regression else 0)) * 100, 1
+            ),
+            "missing": [
+                {
+                    "name": c.name,
+                    "count": n,
+                    "role": role_map.get(c.id, "garnet") if role_map else "garnet",
+                }
+                for c, n in missing
+            ],
+            "total_missing": len(missing),
+        })
+    analysis_data.sort(key=lambda r: r["completion"], reverse=True)
+
+    # ── CATALOG tab ──────────────────────────────────────────────────────────
+    catalog_list = sorted(
+        [
+            {
+                "id": card.id,
+                "name": card.name,
+                "type": card.card_type,
+                "set": card.set_id,
+                "img": _card_image_url(card.id),
+            }
+            for card in catalog.values()
+        ],
+        key=lambda x: x["id"],
+    )
+
+    return {
+        "decks": decks_data,
+        "meta": meta_data,
+        "analysis": analysis_data,
+        "catalog": catalog_list,
+        "matchup": matchup_matrix or {},
+        "regression": {
+            "r2":        round(regression.r_squared, 3),
+            "coef":      {r: round(regression.coef[r] * 100, 2) for r in _ROLES},
+            "intercept": round(regression.intercept * 100, 1),
+        } if regression else {},
+    }
+
+
+def _build_html(page_data: dict, my_cards: dict) -> str:  # noqa: E501
+    """Return a fully self-contained retro HTML page as a string."""
+    decks_json = json.dumps(page_data["decks"])
+    meta_json = json.dumps(page_data["meta"])
+    analysis_json = json.dumps(page_data["analysis"])
+    catalog_json = json.dumps(page_data.get("catalog", []))
+    matchup_json = json.dumps(page_data.get("matchup", {}))
+    regression_json = json.dumps(page_data.get("regression", {}))
+    collection_json = json.dumps(my_cards)
+
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>PKMN TCG POCKET // COLLECTION MANAGER</title>
+<link href="https://fonts.googleapis.com/css2?family=DotGothic16&family=JetBrains+Mono:wght@400;600;700&family=Press+Start+2P&display=swap" rel="stylesheet">
+<style>
+  :root {{
+    --bg:        #FBF3E4;
+    --panel:     #F2E8D2;
+    --card-bg:   #FFFFFF;
+    --border:    #0A0A0A;
+    --text:      #0A0A0A;
+    --pink:      #E63462;
+    --blue:      #1B5DEF;
+    --green:     #2E7D32;
+    --gold:      #F9C846;
+    --red:       #CC2222;
+    --dim:       #6B6660;
+    --font:      'DotGothic16', monospace;
+    --pixel:     'Press Start 2P', monospace;
+    --mono:      'JetBrains Mono', monospace;
+    --shadow:     4px 4px 0 0 #0A0A0A;
+    --shadow-lg:  8px 8px 0 0 #0A0A0A;
+    --shadow-sm:  2px 2px 0 0 #0A0A0A;
+    --shadow-hard:6px 6px 0 0 #0A0A0A;
+    --bg-deep:   #F2E8D2;
+  }}
+  * {{ box-sizing: border-box; margin: 0; padding: 0; border-radius: 0 !important; }}
+  body {{
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--mono);
+    font-size: 13px;
+    min-height: 100vh;
+    overflow-x: hidden;
+  }}
+  @keyframes slideIn {{from{{transform:translateY(-10px);opacity:0}}to{{transform:translateY(0);opacity:1}}}}
+  @keyframes shoppu-marquee {{from{{transform:translateX(0)}}to{{transform:translateX(-50%)}}}}
+  @keyframes shoppu-jump {{0%,100%{{transform:translateY(0)}}50%{{transform:translateY(-3px)}}}}
+  @keyframes shoppu-wiggle {{0%,100%{{transform:rotate(-1deg)}}50%{{transform:rotate(1deg)}}}}
+  #main-ui {{ display: flex; flex-direction: column; height: 100vh; }}
+
+  /* ── Top nav ── */
+  #top-nav {{
+    position: relative; z-index: 200; flex-shrink: 0;
+    display: flex; align-items: stretch;
+    background: var(--bg); border-bottom: 4px solid var(--border);
+    height: 72px;
+  }}
+  #nav-logo {{
+    display: flex; align-items: center; gap: 14px;
+    padding: 0 24px; border-right: 4px solid var(--border);
+    min-width: 230px; flex-shrink: 0; text-decoration: none;
+  }}
+  #nav-logo svg {{ flex-shrink: 0; }}
+  #nav-logo-name {{
+    font-family: var(--font); font-size: 18px; color: var(--text);
+    font-weight: 700; line-height: 1.2;
+  }}
+  #nav-logo-sub {{
+    font-family: var(--pixel); font-size: 7px; color: var(--dim); margin-top: 4px;
+  }}
+  #nav-links {{ display: flex; flex: 1; align-items: stretch; }}
+  .tab-btn {{
+    background: transparent; border: none;
+    border-right: 4px solid var(--border);
+    padding: 0 22px; cursor: pointer;
+    display: flex; flex-direction: column;
+    align-items: center; justify-content: center;
+    gap: 5px; transition: background .1s;
+    min-width: 120px;
+  }}
+  .tab-btn:last-child {{ border-right: none; }}
+  .tab-btn .nav-en {{ font-family: var(--font); font-size: 18px; color: var(--text); font-weight: 700; }}
+  .tab-btn .nav-jp {{ font-family: var(--pixel); font-size: 7px; color: var(--dim); }}
+  .tab-btn:hover {{ background: rgba(0,0,0,.05); }}
+  .tab-btn.active {{ background: var(--border); }}
+  .tab-btn.active .nav-en {{ color: #fff; }}
+  .tab-btn.active .nav-jp {{ color: rgba(255,255,255,.55); }}
+  #nav-right {{
+    display: flex; align-items: center; gap: 12px;
+    padding: 0 20px; border-left: 4px solid var(--border); flex-shrink: 0;
+  }}
+  #total-label {{ font-family: var(--font); font-size: 14px; color: var(--text); white-space: nowrap; }}
+  #refresh-btn {{
+    background: var(--bg); border: 2px solid var(--border); color: var(--text);
+    font-family: var(--font); font-size: 18px; padding: 6px 12px;
+    cursor: pointer; transition: box-shadow .07s, transform .07s; line-height: 1;
+    box-shadow: var(--shadow);
+  }}
+  #refresh-btn:hover {{ box-shadow: none; transform: translate(4px,4px); }}
+  #refresh-btn:disabled {{ opacity: .4; cursor: not-allowed; box-shadow: none; transform: none; }}
+  #save-btn {{
+    background: var(--border); border: 2px solid var(--border); color: var(--bg);
+    font-family: var(--font); font-size: 12px; padding: 10px 20px;
+    cursor: pointer; letter-spacing: 1px; white-space: nowrap;
+    box-shadow: var(--shadow); transition: box-shadow .07s, transform .07s;
+  }}
+  #save-btn:hover {{ box-shadow: none; transform: translate(4px,4px); }}
+
+  /* ── Marquee strip ── */
+  #marquee-strip {{
+    flex-shrink: 0; border-bottom: 4px solid var(--border);
+    background: var(--border); color: var(--bg);
+    font-family: var(--font); font-size: 16px;
+    padding: 8px 0; overflow: hidden; white-space: nowrap;
+  }}
+  #marquee-inner {{
+    display: inline-flex;
+    animation: shoppu-marquee 40s linear infinite;
+  }}
+  .mq-item {{ padding: 0 40px; }}
+  .mq-slash {{ color: var(--pink); margin-right: 6px; }}
+
+  /* ── Status toast ── */
+  #status-msg {{
+    position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%);
+    font-family: var(--font); font-size: 11px; color: var(--bg);
+    background: var(--border); border: 4px solid var(--border);
+    box-shadow: var(--shadow); padding: 12px 24px; z-index: 5000;
+    opacity: 0; transition: opacity .3s; pointer-events: none; white-space: nowrap;
+  }}
+  #status-msg.visible {{ opacity: 1; pointer-events: auto; }}
+  #status-msg.ok  {{ background: var(--green); border-color: var(--green); }}
+  #status-msg.err {{ background: var(--red);   border-color: var(--red); }}
+
+  /* ── Content ── */
+  #content {{ flex: 1; overflow: hidden; min-height: 0; }}
+  .tab-pane {{
+    display: none; height: 100%; overflow-y: auto;
+    padding: 40px 48px 60px;
+  }}
+  .tab-pane.active {{ display: block; }}
+  .tab-pane::-webkit-scrollbar {{ width: 6px; }}
+  .tab-pane::-webkit-scrollbar-thumb {{ background: #ccc; }}
+
+  /* ── Page header (per-tab large title) ── */
+  .page-header {{
+    padding: 0 0 24px; margin-bottom: 36px;
+    border-bottom: 4px solid var(--border);
+  }}
+  .page-header h1 {{
+    font-family: var(--font); font-size: 56px; font-weight: 700;
+    letter-spacing: -1px; line-height: 1; color: var(--text);
+  }}
+  .page-header-jp {{
+    font-family: var(--pixel); font-size: 11px; color: var(--pink); margin-top: 10px;
+  }}
+
+  /* ── Section label ── */
+  .section-label {{
+    display: flex; align-items: baseline; gap: 14px;
+    margin: 40px 0 20px; border-bottom: 2px solid var(--border); padding-bottom: 12px;
+  }}
+  .section-label h2 {{ font-family: var(--font); font-size: 26px; font-weight: 700; }}
+  .section-label span {{ font-family: var(--pixel); font-size: 9px; color: var(--dim); }}
+  .wr-hi {{ color: var(--green); font-weight: bold; }}
+  .wr-lo {{ color: var(--red); }}
+
+  /* ── META tab — arch-card grid ── */
+  .meta-grid {{ display: grid; grid-template-columns: repeat(5, 1fr); gap: 20px; }}
+  .arch-card {{
+    background: var(--card-bg); border: 4px solid var(--border);
+    cursor: default; box-shadow: var(--shadow); overflow: hidden; position: relative;
+    transition: box-shadow .1s, transform .1s; animation: slideIn .3s ease;
+  }}
+  .arch-card:hover {{ box-shadow: var(--shadow-lg); transform: translate(-4px,-4px); }}
+  .arch-img-area {{
+    height: 220px; background: var(--panel); border-bottom: 4px solid var(--border);
+    display: flex; align-items: center; justify-content: center;
+    position: relative; overflow: hidden;
+  }}
+  .arch-img-area img {{
+    height: 100%; width: 100%; object-fit: contain; display: block;
+  }}
+  .arch-sticker {{
+    position: absolute; top: 10px; left: 10px;
+    background: var(--gold); border: 2px solid var(--border);
+    font-family: var(--pixel); font-size: 7px; color: var(--text);
+    padding: 4px 8px; box-shadow: 2px 2px 0 0 var(--border);
+    transform: rotate(-3deg);
+  }}
+  .arch-body {{ padding: 16px; }}
+  .arch-name {{
+    font-family: var(--font); font-size: 13px; color: var(--text);
+    margin-bottom: 10px; font-weight: 700; white-space: nowrap;
+    overflow: hidden; text-overflow: ellipsis;
+  }}
+  .arch-stats {{ display: flex; align-items: flex-end; justify-content: space-between; }}
+  .arch-share {{ font-family: var(--font); font-size: 28px; color: var(--pink); font-weight: 700; line-height: 1; }}
+  .arch-wr {{ font-family: var(--pixel); font-size: 8px; color: var(--dim); text-align: right; line-height: 2.2; }}
+
+  /* ── COLLECTION tab ── */
+  #collection-pane {{
+    padding: 0 !important;
+    display: none;
+    grid-template-columns: 420px 1fr;
+    height: 100%;
+    overflow: hidden;
+  }}
+  #collection-pane.active {{ display: grid !important; }}
+  #deck-list {{
+    border-right: 4px solid var(--border);
+    overflow-y: auto; padding: 14px 12px 40px;
+    background: var(--panel);
+  }}
+  #deck-list::-webkit-scrollbar {{ width: 6px; }}
+  #deck-list::-webkit-scrollbar-thumb {{ background: var(--dim); }}
+  .deck-item {{
+    cursor: pointer; padding: 14px; margin-bottom: 10px;
+    border: 4px solid var(--border); background: var(--card-bg);
+    box-shadow: var(--shadow);
+    transition: box-shadow .1s, transform .1s; animation: slideIn .3s ease;
+  }}
+  .deck-item:hover {{ background: rgba(230,52,98,.06); box-shadow: var(--shadow-lg); transform: translate(-4px,-4px); }}
+  .deck-item.active {{ background: var(--border); box-shadow: none; transform: translate(4px,4px); }}
+  .deck-item .dname {{
+    font-family: var(--font); font-size: 12px; color: var(--text);
+    margin-bottom: 8px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }}
+  .deck-item.active .dname {{ color: #fff; }}
+  .xp-bar-wrap {{ background: var(--panel); height: 10px; border: 2px solid var(--border); margin: 6px 0; padding: 2px; }}
+  .xp-bar {{ height: 100%; background: var(--green); transition: width .4s ease; }}
+  .xp-bar.low {{ background: var(--red); }}
+  .xp-bar.mid {{ background: var(--gold); }}
+  .deck-meta {{ display: flex; justify-content: space-between; font-size: 11px; color: var(--dim); margin-top: 6px; font-family: var(--mono); }}
+  .deck-item.active .deck-meta {{ color: rgba(255,255,255,.65); }}
+  #card-area {{ overflow-y: auto; padding: 28px 32px; background: var(--bg); }}
+  #card-area::-webkit-scrollbar {{ width: 6px; }}
+  #card-area::-webkit-scrollbar-thumb {{ background: var(--dim); }}
+  #deck-title-row {{
+    display: flex; align-items: center; justify-content: center;
+    gap: 10px; margin-bottom: 24px; padding-bottom: 16px;
+    border-bottom: 4px solid var(--border);
+  }}
+  #deck-title {{ font-family: var(--font); font-size: 16px; color: var(--text); flex: 1; text-align: center; font-weight: 700; }}
+  #clear-deck-btn {{
+    background: transparent; border: 2px solid var(--red); color: var(--red);
+    font-family: var(--font); font-size: 9px; padding: 8px 12px;
+    cursor: pointer; white-space: nowrap; flex-shrink: 0;
+    box-shadow: var(--shadow-sm); transition: box-shadow .07s, transform .07s;
+  }}
+  #clear-deck-btn:hover {{ background: var(--red); color: #fff; box-shadow: none; transform: translate(4px,4px); }}
+  #clear-deck-btn:disabled {{ opacity: .3; cursor: not-allowed; box-shadow: none; transform: none; }}
+  #card-grid {{ display: grid; grid-template-columns: repeat(5, 1fr); gap: 16px; }}
+
+  /* ── Card tile (Collection + Catalog shared) ── */
+  .card {{
+    border: 4px solid var(--border); background: var(--card-bg);
+    padding: 10px 8px; text-align: center; position: relative;
+    box-shadow: var(--shadow); transition: box-shadow .1s, transform .1s;
+  }}
+  .card:hover {{ box-shadow: var(--shadow-lg); transform: translate(-4px,-4px); }}
+  .card.owned  {{ border-color: var(--green); }}
+  .card.partial {{ border-color: var(--gold); }}
+  .card.missing {{ opacity: .55; }}
+  .card-type-badge {{
+    font-family: var(--font); font-size: 8px; padding: 3px 8px;
+    margin-bottom: 6px; display: inline-block; letter-spacing: 0.5px;
+    border: 1px solid rgba(0,0,0,.2); color: var(--text);
+  }}
+  .type-Pokemon {{ background: #FFD9E6; }}
+  .type-Trainer {{ background: #FFE5C2; }}
+  .type-Energy  {{ background: #FFF5C2; }}
+  .card-name {{ font-family: var(--font); font-size: 8px; color: var(--text); margin-bottom: 8px; line-height: 1.6; min-height: 24px; word-break: break-word; }}
+  .need-label {{ font-family: var(--font); font-size: 8px; color: var(--dim); margin-bottom: 6px; }}
+  .counter {{ display: flex; align-items: center; justify-content: center; gap: 6px; margin-top: 6px; }}
+  .btn-counter {{
+    background: var(--border); border: 2px solid var(--border); color: var(--bg);
+    font-family: var(--font); font-size: 14px; width: 30px; height: 30px;
+    cursor: pointer; line-height: 1; padding: 0;
+    box-shadow: var(--shadow-sm); transition: box-shadow .07s, transform .07s;
+  }}
+  .btn-counter:hover {{ box-shadow: none; transform: translate(4px,4px); }}
+  .count-display {{ font-family: var(--font); font-size: 14px; color: var(--text); min-width: 24px; text-align: center; }}
+  .card-img {{ width: 84px; height: 116px; object-fit: contain; display: block; margin: 4px auto; border: 1px solid #ddd; background: var(--panel); }}
+  .card-img-fallback {{
+    width: 84px; height: 116px; display: flex; align-items: center;
+    justify-content: center; font-size: 36px; border: 1px solid #ddd;
+    margin: 4px auto; background: var(--panel);
+  }}
+  /* Catalog owned badge */
+  .owned-badge {{
+    position: absolute; top: 5px; right: 5px;
+    background: var(--green); color: #fff;
+    font-family: var(--pixel); font-size: 6px; padding: 3px 5px;
+    border: 1px solid var(--border); letter-spacing: 0;
+  }}
+
+  /* ── ANALYSIS tab (Shoppu Fighter layout) ── */
+  #analysis-pane {{ padding: 0 !important; }}
+  .an-header {{
+    padding: 56px 32px 24px; border-bottom: 2px solid var(--border);
+  }}
+  .an-header-eyebrow {{
+    display: flex; align-items: center; gap: 12px; margin-bottom: 14px;
+    font-family: var(--pixel); font-size: 10px;
+  }}
+  .an-header-eyebrow .an-route {{ color: var(--text); }}
+  .an-header-eyebrow .an-rule {{ flex: 1; height: 2px; background: var(--border); }}
+  .an-header-eyebrow .an-badge {{ color: var(--text); }}
+  .an-headline {{
+    font-family: var(--font); font-size: 56px; font-weight: 700; line-height: 1;
+    color: var(--text); margin-bottom: 10px;
+  }}
+  .an-headline .pink {{ color: var(--pink); }}
+  .an-subtitle {{
+    font-family: var(--pixel); font-size: 11px; color: var(--dim);
+  }}
+
+  /* Scoreboard hero */
+  .an-scoreboard {{
+    display: grid; grid-template-columns: 1fr 320px 1fr;
+    gap: 36px; padding: 40px 32px;
+  }}
+  .an-score-card-wrap {{ display: flex; flex-direction: column; gap: 10px; }}
+  .an-score-card-wrap.right {{ align-items: flex-end; }}
+  .an-sc-above {{
+    font-family: var(--pixel); font-size: 9px; color: var(--dim);
+  }}
+  .an-sc-body {{
+    width: 100%; height: 440px; background: var(--bg-deep);
+    border: 4px solid var(--border); box-shadow: var(--shadow-hard);
+    position: relative; cursor: pointer; overflow: hidden;
+    transition: transform .1s;
+    display: flex; align-items: center; justify-content: center;
+  }}
+  .an-sc-body:hover {{ transform: translate(-2px,-2px); }}
+  /* 3-card row inside the score card */
+  .an-sc-hand {{
+    display: flex; align-items: center; justify-content: center;
+    height: 100%; width: 100%; padding: 20px;
+    gap: 10px; overflow: hidden;
+  }}
+  .an-sc-hand-card {{
+    flex: 0 0 auto; width: 160px; height: 100%;
+    max-height: 400px;
+    border: 2px solid var(--border); box-shadow: 2px 2px 0 0 #0A0A0A;
+    overflow: hidden; background: var(--panel); position: relative;
+  }}
+  .an-sc-hand-card img {{ width: 100%; height: 100%; object-fit: cover; object-position: center top; display: block; }}
+  .an-sc-hand-card.hc-left  {{ z-index: 1; }}
+  .an-sc-hand-card.hc-mid   {{ z-index: 3; }}
+  .an-sc-hand-card.hc-right {{ z-index: 1; }}
+  .an-sc-hand-blank {{
+    width: 100%; height: 100%; display: flex; align-items: center; justify-content: center;
+    font-size: 28px; color: var(--dim); background: var(--bg-deep);
+  }}
+  .an-sc-tag {{
+    position: absolute; bottom: 8px; left: 8px;
+    background: white; border: 2px solid var(--border);
+    font-family: var(--pixel); font-size: 10px; padding: 4px 8px;
+  }}
+  .an-sc-tag.right {{ left: auto; right: 8px; }}
+  .an-sc-name {{
+    font-family: var(--font); font-size: 32px; line-height: 1.05;
+  }}
+  .an-sc-meta {{
+    font-family: var(--pixel); font-size: 11px; color: var(--pink);
+  }}
+  .an-sc-dna {{
+    height: 14px; border: 1px solid var(--border);
+    display: flex; overflow: hidden; width: 100%;
+  }}
+  .an-sc-dna-seg {{ height: 100%; }}
+  .an-sc-empty {{
+    display: flex; align-items: center; justify-content: center;
+    border: 4px dashed var(--dim) !important;
+    box-shadow: none !important;
+  }}
+  .an-sc-prompt {{
+    font-family: var(--pixel); font-size: 10px; color: var(--dim);
+    text-align: center; line-height: 2.5; letter-spacing: 1px;
+  }}
+
+  /* Verdict core */
+  .an-verdict-core {{
+    display: flex; flex-direction: column; align-items: center;
+    justify-content: center; gap: 12px; padding: 20px 0;
+  }}
+  .an-verdict-sticker {{
+    font-family: var(--pixel); font-size: 11px; letter-spacing: 2px;
+    padding: 8px 14px; border: 2px solid var(--border);
+    box-shadow: 3px 3px 0 0 #0A0A0A; transform: rotate(-3deg);
+  }}
+  .an-verdict-label {{
+    font-family: var(--pixel); font-size: 10px; color: var(--dim);
+  }}
+  .an-verdict-wr {{
+    font-family: var(--pixel); font-size: 64px; letter-spacing: 3px; line-height: 1;
+  }}
+  .an-verdict-r2 {{
+    font-family: var(--pixel); font-size: 11px; color: var(--dim);
+  }}
+  .an-verdict-dots {{ display: flex; gap: 6px; }}
+  .an-verdict-dots span {{
+    width: 8px; height: 8px; background: var(--dim); display: inline-block;
+    animation: shoppu-jump .6s ease-in-out infinite;
+  }}
+
+  /* Insight strip */
+  .an-insight {{
+    background: #0A0A0A; padding: 20px 32px;
+    display: flex; align-items: center; gap: 28px; flex-wrap: wrap;
+  }}
+  .an-insight-lead {{
+    font-family: var(--pixel); font-size: 10px; color: var(--gold); flex-shrink: 0;
+  }}
+  .an-insight-items {{
+    display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
+  }}
+  .an-insight-item {{
+    font-family: var(--mono); font-size: 13px; color: #FBF3E4;
+  }}
+  .an-insight-item strong {{ color: var(--pink); font-weight: 700; }}
+  .an-insight-div {{ color: var(--dim); }}
+
+  /* Matchup navigator */
+  .an-nav {{
+    background: var(--panel); padding: 20px 32px;
+    border-bottom: 2px solid var(--border);
+    display: flex; align-items: center; gap: 24px;
+  }}
+  .an-nav-label {{
+    border-right: 2px solid var(--border);
+    padding-right: 24px; flex-shrink: 0;
+  }}
+  .an-nav-label .big {{ font-family: var(--font); font-size: 14px; font-weight: 700; }}
+  .an-nav-label .small {{ font-family: var(--pixel); font-size: 8px; color: var(--dim); margin-top: 2px; }}
+  .an-nav-pills {{
+    flex: 1; display: flex; gap: 8px; overflow-x: auto;
+    scrollbar-width: thin;
+  }}
+  .an-nav-pill {{
+    display: flex; align-items: center; gap: 6px;
+    padding: 8px 12px; border: 2px solid var(--border);
+    box-shadow: 3px 3px 0 0 #0A0A0A; background: white; cursor: pointer;
+    flex-shrink: 0; white-space: nowrap;
+    transition: transform .07s, box-shadow .07s;
+  }}
+  .an-nav-pill:hover {{ transform: translate(-1px,-1px); box-shadow: 4px 4px 0 0 #0A0A0A; }}
+  .an-nav-pill.active {{
+    background: #0A0A0A; color: white;
+    box-shadow: 1px 1px 0 0 #0A0A0A; transform: translate(2px,2px);
+  }}
+  .an-nav-pill img {{
+    width: 24px; height: 24px; object-fit: cover; border: 1px solid var(--border);
+    flex-shrink: 0;
+  }}
+  .an-nav-pill .pill-name {{ font-family: var(--font); font-size: 11px; }}
+  .an-nav-pill .pill-wr {{ font-family: var(--pixel); font-size: 9px; }}
+  .an-nav-right {{
+    border-left: 2px solid var(--border);
+    padding-left: 24px; flex-shrink: 0;
+    font-family: var(--pixel); font-size: 11px;
+    display: flex; flex-direction: column; gap: 4px;
+  }}
+
+  /* Workspace */
+  .an-workspace {{
+    display: grid; grid-template-columns: 1.2fr 1fr;
+    gap: 24px; padding: 40px 32px 0; align-items: start;
+  }}
+  .an-panel {{
+    background: var(--card-bg); border: 4px solid var(--border);
+    box-shadow: 4px 4px 0 0 #0A0A0A; padding: 24px;
+  }}
+  .an-panel-eyebrow {{
+    font-family: var(--pixel); font-size: 10px; color: var(--pink); margin-bottom: 6px;
+  }}
+  .an-panel-title {{
+    font-family: var(--font); font-size: 28px; font-weight: 700;
+  }}
+  .an-panel-subtitle {{
+    font-family: var(--pixel); font-size: 9px; color: var(--dim);
+    border-bottom: 2px solid var(--border); padding-bottom: 10px; margin-bottom: 18px;
+    display: block; margin-top: 4px;
+  }}
+
+  /* Role chip rows */
+  .an-role-row {{
+    display: grid; grid-template-columns: 120px 1fr 80px 80px;
+    padding: 10px 14px; border: 2px solid var(--border);
+    box-shadow: 3px 3px 0 0 #0A0A0A; background: white;
+    margin-bottom: 8px; cursor: pointer;
+    transition: border-color .1s;
+  }}
+  .an-role-row:hover {{ border-color: var(--pink); }}
+  .an-role-row.active {{ border-color: var(--pink); box-shadow: 3px 3px 0 0 var(--pink); background: #FFE4EE; }}
+  .an-role-badge {{
+    font-family: var(--pixel); font-size: 9px; padding: 4px 8px;
+    border: 1px solid rgba(0,0,0,.2); color: #fff; display: inline-block;
+    align-self: center;
+  }}
+  .an-role-badge.role-tech {{ color: var(--text); }}
+  .an-comp-bar-wrap {{
+    background: var(--panel); height: 8px; border: 1px solid var(--border);
+    align-self: center;
+  }}
+  .an-comp-bar-fill {{ height: 100%; transition: width .4s ease; }}
+  .an-comp-bar-label {{
+    font-family: var(--pixel); font-size: 8px; color: var(--dim); margin-top: 4px;
+  }}
+  .an-role-attr {{
+    font-family: var(--pixel); font-size: 13px; text-align: right; align-self: center;
+  }}
+  .an-role-attr-label {{
+    font-family: var(--pixel); font-size: 8px; color: var(--dim); text-align: right; align-self: center; line-height: 1.6;
+  }}
+
+  /* Card list */
+  .an-card-list-header {{
+    display: flex; align-items: center; gap: 10px;
+    border-top: 2px solid var(--border); padding-top: 18px; margin-top: 18px;
+    margin-bottom: 12px;
+  }}
+  .an-card-list-title {{ font-family: var(--pixel); font-size: 10px; flex: 1; }}
+  .an-filter-badge {{
+    font-family: var(--pixel); font-size: 8px; color: var(--pink);
+    border: 1px solid var(--pink); padding: 2px 6px;
+  }}
+  .an-clear-btn {{
+    font-family: var(--pixel); font-size: 8px; color: var(--dim);
+    background: none; border: 1px solid var(--border); cursor: pointer; padding: 4px 8px;
+  }}
+  .an-acq-item {{
+    display: flex; align-items: center; gap: 14px;
+    padding: 10px; border: 2px solid var(--border); background: white;
+    margin-bottom: 6px;
+  }}
+  .an-acq-thumb {{
+    width: 40px; height: 56px; background: var(--bg-deep);
+    border: 1px solid var(--border); flex-shrink: 0; object-fit: cover;
+  }}
+  .an-acq-name {{ font-family: var(--font); font-size: 16px; flex: 1; }}
+  .an-acq-count {{ font-family: var(--pixel); font-size: 14px; color: var(--pink); }}
+  .an-acq-empty {{
+    border: 2px dashed var(--border); padding: 20px;
+    font-family: var(--pixel); font-size: 9px; color: var(--dim);
+    text-align: center; line-height: 2.5;
+  }}
+
+  /* Why panel */
+  .an-callout {{
+    background: white; border: 2px solid var(--border);
+    padding: 14px; margin-bottom: 16px;
+    font-family: var(--mono); font-size: 14px;
+  }}
+  .an-callout .arrow {{ color: var(--pink); }}
+  .an-diverg {{
+    background: white; border: 2px solid var(--border); padding: 16px;
+  }}
+  .an-diverg-header {{
+    display: grid; grid-template-columns: 90px 1fr 1fr 90px;
+    gap: 8px; margin-bottom: 8px;
+  }}
+  .an-diverg-header span {{
+    font-family: var(--pixel); font-size: 8px; color: var(--dim);
+  }}
+  .an-diverg-row {{
+    display: grid; grid-template-columns: 90px 1fr 1fr 90px;
+    gap: 8px; align-items: center; margin-bottom: 6px;
+  }}
+  .an-diverg-your {{
+    position: relative; height: 20px;
+  }}
+  .an-diverg-bar-y {{
+    position: absolute; right: 0; height: 100%; top: 0;
+    min-width: 2px;
+  }}
+  .an-diverg-meta {{
+    position: relative; height: 20px;
+  }}
+  .an-diverg-bar-m {{
+    position: absolute; left: 0; height: 100%; top: 0;
+    min-width: 2px; opacity: .8;
+  }}
+  .an-diverg-delta {{
+    font-family: var(--pixel); font-size: 10px; text-align: center;
+  }}
+
+  /* Field band */
+  .an-field {{
+    padding: 48px 32px 96px; border-top: 2px solid var(--border);
+    margin-top: 40px;
+  }}
+  .an-field-eyebrow {{ font-family: var(--pixel); font-size: 11px; color: var(--pink); }}
+  .an-field-title {{ font-family: var(--font); font-size: 28px; font-weight: 700; margin: 6px 0 4px; }}
+  .an-field-subtitle {{ font-family: var(--pixel); font-size: 9px; color: var(--dim); margin-bottom: 24px; display: block; }}
+  .an-tier-row {{
+    display: flex; gap: 18px; padding: 18px;
+    border: 4px solid var(--border); box-shadow: 4px 4px 0 0 #0A0A0A;
+    background: var(--card-bg); margin-bottom: 16px;
+    align-items: flex-start;
+  }}
+  .an-tier-badge {{
+    width: 64px; height: 64px; display: flex; flex-direction: column;
+    align-items: center; justify-content: center; flex-shrink: 0;
+    border: 2px solid white;
+  }}
+  .an-tier-badge .tier-letter {{ font-family: var(--font); font-size: 32px; font-weight: 700; line-height: 1; }}
+  .an-tier-badge .tier-sub {{ font-family: var(--pixel); font-size: 9px; }}
+  .an-tier-decks {{ display: flex; flex-wrap: wrap; gap: 12px; flex: 1; }}
+  .an-tier-deck {{
+    width: 110px; background: var(--bg-deep); border: 2px solid var(--border);
+    cursor: pointer; overflow: hidden;
+    transition: border-color .1s, box-shadow .1s;
+  }}
+  .an-tier-deck:hover {{ border-color: var(--pink); }}
+  .an-tier-deck.active {{ border: 3px solid var(--pink); box-shadow: 3px 3px 0 0 var(--pink); }}
+  .an-tier-deck .td-img {{
+    width: 100%; height: 64px; object-fit: cover; display: block;
+  }}
+  .an-tier-deck .td-body {{ padding: 6px 8px; }}
+  .an-tier-deck .td-name {{ font-family: var(--font); font-size: 11px; margin-bottom: 4px; line-height: 1.2; }}
+  .an-tier-deck .td-wr {{ font-family: var(--pixel); font-size: 9px; }}
+  .an-tier-deck .td-meta {{ font-family: var(--pixel); font-size: 7px; color: var(--dim); }}
+
+  /* Deck picker overlay */
+  #an-picker-overlay {{
+    display: none; position: fixed; inset: 0;
+    background: rgba(10,10,10,.55); z-index: 1000;
+    align-items: center; justify-content: center;
+  }}
+  #an-picker-overlay.open {{ display: flex; }}
+  #an-picker-modal {{
+    max-width: 880px; width: 96vw;
+    background: var(--card-bg); border: 4px solid var(--border);
+    box-shadow: 8px 8px 0 0 #0A0A0A; padding: 32px; max-height: 90vh; overflow-y: auto;
+  }}
+  .an-picker-header {{
+    display: flex; align-items: center; justify-content: space-between;
+    margin-bottom: 20px; padding-bottom: 16px; border-bottom: 2px solid var(--border);
+  }}
+  .an-picker-header h2 {{ font-family: var(--font); font-size: 24px; font-weight: 700; }}
+  .an-picker-sub {{ font-family: var(--pixel); font-size: 9px; color: var(--dim); margin-top: 4px; }}
+  .an-picker-close {{
+    background: var(--border); border: 2px solid var(--border); color: white;
+    font-family: var(--pixel); font-size: 9px; padding: 8px 14px; cursor: pointer;
+  }}
+  .an-picker-grid {{
+    display: grid; grid-template-columns: repeat(5,1fr); gap: 14px;
+  }}
+  .an-picker-card {{
+    background: var(--bg-deep); border: 4px solid var(--border);
+    box-shadow: var(--shadow); padding: 14px;
+    display: flex; flex-direction: column; align-items: center; gap: 8px;
+    cursor: pointer; transition: border-color .1s;
+  }}
+  .an-picker-card:hover {{ border-color: var(--pink); }}
+  .an-picker-card.selected {{ border-color: var(--pink); box-shadow: 4px 4px 0 0 var(--pink); }}
+  /* mini 3-card fan inside each picker card */
+  .an-picker-hand {{
+    width: 100%; height: 90px;
+    display: flex; align-items: flex-end; justify-content: center;
+    overflow: hidden; position: relative;
+  }}
+  .an-picker-hcard {{
+    width: 52px; height: 73px; flex-shrink: 0;
+    border: 1px solid var(--border); overflow: hidden; background: var(--panel);
+  }}
+  .an-picker-hcard img {{ width: 100%; height: 100%; object-fit: cover; display: block; }}
+  .an-picker-hcard.hc-left  {{ transform: rotate(-6deg) translateY(8px); margin-right: -8px; z-index: 1; }}
+  .an-picker-hcard.hc-mid   {{ z-index: 3; }}
+  .an-picker-hcard.hc-right {{ transform: rotate(6deg) translateY(8px); margin-left: -8px; z-index: 1; }}
+  .an-picker-name {{ font-family: var(--font); font-size: 13px; text-align: center; line-height: 1.3; }}
+  .an-picker-meta {{ font-family: var(--pixel); font-size: 9px; color: var(--pink); }}
+
+  /* ── CATALOG tab ── */
+  #catalog-filters {{
+    display: flex; flex-wrap: wrap; gap: 10px; align-items: center;
+    margin-bottom: 20px; padding-bottom: 20px; border-bottom: 4px solid var(--border);
+  }}
+  #cat-search {{
+    background: var(--card-bg); border: 2px solid var(--border); color: var(--text);
+    font-family: var(--mono); font-size: 14px; padding: 10px 14px;
+    flex: 1; min-width: 160px; outline: none;
+    box-shadow: var(--shadow);
+  }}
+  #cat-search:focus {{ border-color: var(--pink); outline: 2px solid var(--pink); }}
+  #cat-search::placeholder {{ color: var(--dim); }}
+  #cat-set {{
+    background: var(--card-bg); border: 2px solid var(--border); color: var(--text);
+    font-family: var(--mono); font-size: 13px; padding: 10px 10px; cursor: pointer; outline: none;
+    box-shadow: var(--shadow);
+  }}
+  /* ShoppuChip filter buttons */
+  .cat-type-btn {{
+    background: var(--card-bg); border: 2px solid var(--border); color: var(--text);
+    font-family: var(--font); font-size: 14px; padding: 10px 18px; cursor: pointer;
+    box-shadow: 4px 4px 0 0 var(--border);
+    transition: box-shadow .07s, transform .07s;
+  }}
+  .cat-type-btn:hover {{ box-shadow: 2px 2px 0 0 var(--border); transform: translate(2px,2px); }}
+  .cat-type-btn.active {{ background: var(--border); color: var(--bg); box-shadow: 2px 2px 0 0 var(--border); transform: translate(2px,2px); }}
+  #cat-count {{ font-family: var(--font); font-size: 10px; color: var(--dim); margin-bottom: 16px; }}
+  #catalog-grid {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(148px, 1fr)); gap: 16px; }}
+  #cat-load-more {{
+    display: block; margin: 28px auto 0;
+    background: var(--border); border: 4px solid var(--border); color: var(--bg);
+    font-family: var(--font); font-size: 11px; padding: 14px 32px; cursor: pointer;
+    letter-spacing: 1px; box-shadow: var(--shadow);
+    transition: box-shadow .07s, transform .07s;
+  }}
+  #cat-load-more:hover {{ box-shadow: none; transform: translate(4px,4px); }}
+  #cat-load-more:disabled {{ display: none; }}
+
+  /* ── NEW DECK button ── */
+  #new-deck-btn {{
+    width: 100%; margin-bottom: 4px; display: block;
+    background: transparent; border: 2px dashed var(--border); color: var(--dim);
+    font-family: var(--font); font-size: 10px; padding: 14px 0; cursor: pointer;
+    letter-spacing: 1px; text-align: center;
+    transition: border-color .12s, color .12s, background .12s;
+  }}
+  #new-deck-btn:hover {{ border-color: var(--pink); color: var(--pink); background: rgba(230,52,98,.04); border-style: solid; }}
+
+  /* ── New Deck modal ── */
+  #nd-overlay {{
+    display: none; position: fixed; inset: 0;
+    background: rgba(0,0,0,.65); z-index: 8000;
+    align-items: center; justify-content: center;
+  }}
+  #nd-overlay.open {{ display: flex; }}
+  #nd-modal {{
+    background: var(--bg); border: 4px solid var(--border);
+    box-shadow: var(--shadow-lg);
+    width: min(780px, 96vw); max-height: 88vh;
+    display: flex; flex-direction: column; overflow: hidden;
+  }}
+  #nd-header {{
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 16px 20px; border-bottom: 4px solid var(--border);
+    font-family: var(--font); font-size: 14px; color: var(--bg);
+    background: var(--border);
+  }}
+  #nd-close {{
+    background: none; border: 2px solid var(--bg); color: var(--bg); font-family: var(--font);
+    font-size: 10px; cursor: pointer; padding: 6px 12px;
+    transition: background .12s, color .12s;
+  }}
+  #nd-close:hover {{ background: var(--bg); color: var(--border); }}
+  #nd-name-row {{
+    padding: 12px 18px; border-bottom: 2px solid var(--border);
+    display: flex; align-items: center; gap: 10px; background: var(--panel);
+  }}
+  #nd-name-row label {{ font-family: var(--font); font-size: 8px; color: var(--dim); white-space: nowrap; }}
+  #nd-name {{
+    flex: 1; background: var(--card-bg); border: 2px solid var(--border);
+    color: var(--text); font-family: var(--mono); font-size: 13px; padding: 8px 10px; outline: none;
+    box-shadow: var(--shadow-sm);
+  }}
+  #nd-name:focus {{ border-color: var(--pink); outline: 2px solid var(--pink); }}
+  #nd-body {{ display: grid; grid-template-columns: 1fr 1fr; flex: 1; overflow: hidden; min-height: 0; }}
+  #nd-search-panel {{
+    border-right: 2px solid var(--border);
+    display: flex; flex-direction: column; overflow: hidden; background: var(--bg);
+  }}
+  #nd-search-wrap {{ padding: 10px 12px; border-bottom: 2px solid var(--border); display: flex; gap: 6px; }}
+  #nd-search {{
+    flex: 1; background: var(--card-bg); border: 2px solid var(--border);
+    color: var(--text); font-family: var(--mono); font-size: 13px; padding: 7px 10px; outline: none;
+    box-shadow: var(--shadow-sm);
+  }}
+  #nd-search:focus {{ border-color: var(--pink); outline: 2px solid var(--pink); }}
+  #nd-results {{ overflow-y: auto; flex: 1; padding: 6px; }}
+  .nd-result {{
+    display: flex; align-items: center; gap: 8px;
+    padding: 8px; border: 2px solid transparent; cursor: pointer; transition: background .1s;
+  }}
+  .nd-result:hover {{ background: var(--panel); border-color: var(--border); }}
+  .nd-result-img {{ width: 30px; height: 42px; object-fit: contain; flex-shrink: 0; border: 1px solid #ccc; }}
+  .nd-result-info {{ flex: 1; min-width: 0; }}
+  .nd-result-name {{ font-family: var(--mono); font-size: 12px; color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }}
+  .nd-result-sub  {{ font-family: var(--mono); font-size: 11px; color: var(--dim); margin-top: 2px; }}
+  .nd-add-btn {{
+    background: var(--border); border: 2px solid var(--border); color: var(--bg);
+    font-family: var(--font); font-size: 9px; padding: 6px 10px; cursor: pointer;
+    flex-shrink: 0; box-shadow: var(--shadow-sm);
+    transition: box-shadow .07s, transform .07s;
+  }}
+  .nd-add-btn:hover {{ box-shadow: none; transform: translate(4px,4px); }}
+  #nd-draft-panel {{ display: flex; flex-direction: column; overflow: hidden; background: var(--bg); }}
+  #nd-draft-header {{
+    padding: 10px 12px; border-bottom: 2px solid var(--border);
+    font-family: var(--font); font-size: 8px; color: var(--dim); display: flex; justify-content: space-between;
+    background: var(--panel);
+  }}
+  #nd-draft-count {{ color: var(--text); }}
+  #nd-draft-list {{ overflow-y: auto; flex: 1; padding: 6px; }}
+  .nd-draft-item {{ display: flex; align-items: center; gap: 6px; padding: 6px; border-bottom: 2px solid var(--panel); }}
+  .nd-draft-name {{ flex: 1; font-family: var(--mono); font-size: 12px; color: var(--text); min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
+  .nd-draft-cnt  {{ font-family: var(--font); font-size: 9px; color: var(--text); min-width: 16px; text-align: center; }}
+  .nd-draft-btn  {{
+    background: var(--border); border: 2px solid var(--border); color: var(--bg);
+    font-family: var(--font); font-size: 10px; width: 24px; height: 24px;
+    cursor: pointer; padding: 0; line-height: 1;
+    box-shadow: var(--shadow-sm); transition: box-shadow .07s, transform .07s; flex-shrink: 0;
+  }}
+  .nd-draft-btn:hover {{ box-shadow: none; transform: translate(4px,4px); }}
+  #nd-footer {{
+    padding: 14px 20px; border-top: 4px solid var(--border);
+    display: flex; gap: 10px; justify-content: flex-end; align-items: center;
+    background: var(--panel);
+  }}
+  #nd-err {{ font-family: var(--font); font-size: 7px; color: var(--red); flex: 1; }}
+  #nd-save-btn {{
+    background: var(--pink); border: 2px solid var(--border); color: #fff;
+    font-family: var(--font); font-size: 12px; padding: 12px 24px; cursor: pointer;
+    letter-spacing: 1px; box-shadow: var(--shadow);
+    transition: box-shadow .07s, transform .07s;
+  }}
+  #nd-save-btn:hover {{ box-shadow: none; transform: translate(4px,4px); }}
+
+  /* ── Role CSS classes ── */
+  .role-win_condition {{ background: var(--pink); }}
+  .role-engine        {{ background: var(--blue); }}
+  .role-staple        {{ background: var(--green); }}
+  .role-tech          {{ background: var(--gold); color: var(--text); }}
+  .role-garnet        {{ background: #FF6B35; }}
+
+  /* ── Boot ── */
+  #boot {{
+    position: fixed; inset: 0; background: var(--bg);
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    z-index: 9000; gap: 16px;
+  }}
+  #boot-title {{
+    font-family: var(--font); font-size: 56px; font-weight: 700;
+    color: var(--text); text-align: center; line-height: 1;
+    letter-spacing: -1px;
+  }}
+  #boot-sub {{
+    font-family: var(--pixel); font-size: 10px; color: var(--pink);
+    text-align: center; margin-top: -4px;
+  }}
+  .boot-line {{ font-family: var(--pixel); font-size: 9px; color: var(--dim); margin-top: 4px; }}
+  #boot-bar-wrap {{
+    width: 320px; height: 24px; border: 4px solid var(--border);
+    background: var(--panel); padding: 4px; margin-top: 4px;
+  }}
+  #boot-bar {{ height: 100%; width: 0%; background: var(--border); transition: width .05s linear; }}
+</style>
+</head>
+<body>
+
+<!-- Boot screen -->
+<div id="boot">
+  <svg width="80" height="80" viewBox="0 0 80 80" fill="none" xmlns="http://www.w3.org/2000/svg">
+    <circle cx="40" cy="40" r="36" fill="white" stroke="#0A0A0A" stroke-width="4"/>
+    <path d="M4 40 h72" stroke="#0A0A0A" stroke-width="4"/>
+    <path d="M4 40 A36 36 0 0 1 76 40" fill="#E63462"/>
+    <circle cx="40" cy="40" r="12" fill="white" stroke="#0A0A0A" stroke-width="4"/>
+    <circle cx="40" cy="40" r="5" fill="#0A0A0A"/>
+  </svg>
+  <div id="boot-title">PKMN.POCKET</div>
+  <div id="boot-sub">METAアナライザ</div>
+  <div class="boot-line">Loading card database...</div>
+  <div id="boot-bar-wrap"><div id="boot-bar"></div></div>
+</div>
+
+<!-- Main UI -->
+<div id="main-ui" style="display:none;">
+  <nav id="top-nav">
+    <div id="nav-logo">
+      <svg width="40" height="40" viewBox="0 0 40 40" fill="none" xmlns="http://www.w3.org/2000/svg">
+        <circle cx="20" cy="20" r="18" fill="white" stroke="#0A0A0A" stroke-width="3"/>
+        <path d="M2 20 h36" stroke="#0A0A0A" stroke-width="3"/>
+        <path d="M2 20 A18 18 0 0 1 38 20" fill="#E63462"/>
+        <circle cx="20" cy="20" r="6" fill="white" stroke="#0A0A0A" stroke-width="3"/>
+        <circle cx="20" cy="20" r="2.5" fill="#0A0A0A"/>
+      </svg>
+      <div>
+        <div id="nav-logo-name">PKMN.POCKET</div>
+        <div id="nav-logo-sub">METAアナライザ・SHOPPU</div>
+      </div>
+    </div>
+    <div id="nav-links">
+      <button class="tab-btn active" onclick="showTab('meta')">
+        <span class="nav-en">Meta</span><span class="nav-jp">メタ</span>
+      </button>
+      <button class="tab-btn" onclick="showTab('collection')">
+        <span class="nav-en">Collection</span><span class="nav-jp">コレクション</span>
+      </button>
+      <button class="tab-btn" onclick="showTab('catalog')">
+        <span class="nav-en">Catalog</span><span class="nav-jp">カタログ</span>
+      </button>
+      <button class="tab-btn" onclick="showTab('analysis')">
+        <span class="nav-en">Analysis</span><span class="nav-jp">分析・チャート</span>
+      </button>
+    </div>
+    <div id="nav-right">
+      <span id="total-label">♥ <span id="total-count">0</span></span>
+      <button id="refresh-btn" onclick="refreshData()" title="Refresh tournament data">⟳</button>
+      <button id="save-btn" onclick="saveCollection()">SAVE</button>
+    </div>
+  </nav>
+
+  <!-- Marquee strip -->
+  <div id="marquee-strip">
+    <div id="marquee-inner">
+      <span class="mq-item"><span class="mq-slash">//</span> PKMN.POCKET</span>
+      <span class="mq-item"><span class="mq-slash">//</span> META ANALYZER</span>
+      <span class="mq-item"><span class="mq-slash">//</span> COMPETITIVE DECKS</span>
+      <span class="mq-item"><span class="mq-slash">//</span> COLLECTION MANAGER</span>
+      <span class="mq-item"><span class="mq-slash">//</span> LIMITLESS TCG API</span>
+      <span class="mq-item"><span class="mq-slash">//</span> WIN RATE ESTIMATOR</span>
+      <span class="mq-item"><span class="mq-slash">//</span> CARD ROLE CLASSIFIER</span>
+      <span class="mq-item"><span class="mq-slash">//</span> PKMN.POCKET</span>
+      <span class="mq-item"><span class="mq-slash">//</span> META ANALYZER</span>
+      <span class="mq-item"><span class="mq-slash">//</span> COMPETITIVE DECKS</span>
+      <span class="mq-item"><span class="mq-slash">//</span> COLLECTION MANAGER</span>
+      <span class="mq-item"><span class="mq-slash">//</span> LIMITLESS TCG API</span>
+      <span class="mq-item"><span class="mq-slash">//</span> WIN RATE ESTIMATOR</span>
+      <span class="mq-item"><span class="mq-slash">//</span> CARD ROLE CLASSIFIER</span>
+    </div>
+  </div>
+
+  <div id="content">
+    <!-- META -->
+    <div class="tab-pane active" id="meta-pane">
+      <div class="page-header">
+        <h1>META</h1>
+        <div class="page-header-jp">メタアーキタイプ ランキング</div>
+      </div>
+      <div class="meta-grid" id="meta-grid"></div>
+    </div>
+
+    <!-- COLLECTION -->
+    <div class="tab-pane" id="collection-pane">
+      <div id="deck-list">
+        <button id="new-deck-btn" onclick="openNewDeck()">➕ NEW DECK</button>
+      </div>
+      <div id="card-area">
+        <div id="deck-title-row">
+          <div id="deck-title">◄ SELECT A DECK ►</div>
+          <button id="clear-deck-btn" onclick="clearDeck()" disabled>🗑 CLEAR</button>
+        </div>
+        <div id="card-grid"></div>
+      </div>
+    </div>
+
+    <!-- CATALOG -->
+    <div class="tab-pane" id="catalog-pane">
+      <div class="page-header">
+        <h1>CATALOG</h1>
+        <div class="page-header-jp">全カードブラウザー</div>
+      </div>
+      <div id="catalog-filters">
+        <input id="cat-search" type="text" placeholder="SEARCH BY NAME..."
+               oninput="filterCatalog()">
+        <select id="cat-set" onchange="filterCatalog()">
+          <option value="">ALL SETS</option>
+        </select>
+        <button class="cat-type-btn active" onclick="setCatType('')">ALL</button>
+        <button class="cat-type-btn" onclick="setCatType('Pokemon')">POKEMON</button>
+        <button class="cat-type-btn" onclick="setCatType('Trainer')">TRAINER</button>
+        <button class="cat-type-btn" onclick="setCatType('Energy')">ENERGY</button>
+      </div>
+      <div id="cat-count"></div>
+      <div id="catalog-grid"></div>
+      <button id="cat-load-more" onclick="loadMoreCatalog()">▼ LOAD MORE</button>
+    </div>
+
+    <!-- ANALYSIS (Shoppu Fighter layout) -->
+    <div class="tab-pane" id="analysis-pane">
+      <div id="an-root"></div>
+    </div>
+  </div>
+</div>
+
+<!-- New Deck Modal -->
+<div id="nd-overlay">
+  <div id="nd-modal">
+    <div id="nd-header">
+      ➕ CREATE NEW DECK
+      <button id="nd-close" onclick="closeNewDeck()">✕ CANCEL</button>
+    </div>
+    <div id="nd-name-row">
+      <label>DECK NAME:</label>
+      <input id="nd-name" type="text" placeholder="e.g. MY CHARIZARD DECK" maxlength="40">
+    </div>
+    <div id="nd-body">
+      <div id="nd-search-panel">
+        <div id="nd-search-wrap">
+          <input id="nd-search" type="text" placeholder="SEARCH CARDS..."
+                 oninput="ndSearch()">
+        </div>
+        <div id="nd-results"></div>
+      </div>
+      <div id="nd-draft-panel">
+        <div id="nd-draft-header">
+          DECK PREVIEW
+          <span id="nd-draft-count">0 / 20 CARDS</span>
+        </div>
+        <div id="nd-draft-list"></div>
+      </div>
+    </div>
+    <div id="nd-footer">
+      <span id="nd-err"></span>
+      <button id="nd-save-btn" onclick="saveDraft()">💾 SAVE DECK</button>
+    </div>
+  </div>
+</div>
+
+<!-- Analysis Deck Picker Overlay -->
+<div id="an-picker-overlay" onclick="anClosePicker(event)">
+  <div id="an-picker-modal">
+    <div class="an-picker-header">
+      <div>
+        <h2>PICK YOUR FIGHTER</h2>
+        <div class="an-picker-sub" id="an-picker-sub">YOUR DECK</div>
+      </div>
+      <button class="an-picker-close" onclick="anClosePicker(null)">✕ CLOSE</button>
+    </div>
+    <div class="an-picker-grid" id="an-picker-grid"></div>
+  </div>
+</div>
+
+<div id="status-msg"></div>
+
+<script>
+const ARCHETYPES    = {decks_json};
+const META_DATA     = {meta_json};
+let   ANALYSIS_DATA = {analysis_json};
+const CATALOG_DATA  = {catalog_json};
+let   MATCHUP_DATA  = {matchup_json};
+let   REGRESSION    = {regression_json};
+let   collection    = {collection_json};
+let   activeDeckIdx = -1;
+let   activeTab     = 'meta';
+
+// Catalog state
+let catFiltered = [];
+let catPage     = 0;
+let catType     = '';
+const CAT_PAGE_SIZE = 60;
+
+const TYPE_SPRITE = {{ "Pokemon":"🎮","Trainer":"🃏","Energy":"⚡" }};
+const TYPE_COLOR  = {{ "Pokemon":"type-Pokemon","Trainer":"type-Trainer","Energy":"type-Energy" }};
+
+// ── Tab system ──────────────────────────────────────────────────────────────
+function showTab(name) {{
+  document.querySelectorAll('.tab-pane').forEach(p => p.classList.remove('active'));
+  document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+  document.getElementById(name + '-pane').classList.add('active');
+  event.currentTarget.classList.add('active');
+  activeTab = name;
+  if (name === 'meta')       renderMeta();
+  if (name === 'collection') renderDeckList();
+  if (name === 'catalog')    initCatalog();
+  if (name === 'analysis')   renderAnalysis();
+  setStatus('', '');
+}}
+
+// ── META tab ────────────────────────────────────────────────────────────────
+function renderMeta() {{
+  const grid = document.getElementById('meta-grid');
+  grid.innerHTML = '';
+  META_DATA.forEach((arch, i) => {{
+    const ewrCls  = arch.ewr >= 52 ? 'wr-hi' : arch.ewr < 48 ? 'wr-lo' : '';
+    const imgHtml = arch.hero_img
+      ? `<img src="${{arch.hero_img}}" alt="${{arch.name}}"
+              onerror="this.style.display='none'">`
+      : `<span style="font-size:56px">🃏</span>`;
+    const div = document.createElement('div');
+    div.className = 'arch-card';
+    div.innerHTML = `
+      <div class="arch-img-area">
+        <div class="arch-sticker">#${{i + 1}}</div>
+        ${{imgHtml}}
+      </div>
+      <div class="arch-body">
+        <div class="arch-name">${{arch.name.toUpperCase()}}</div>
+        <div class="arch-stats">
+          <div class="arch-share">${{arch.meta_share}}%</div>
+          <div class="arch-wr">
+            WIN ${{arch.win_rate}}%<br>
+            E[WR] <span class="${{ewrCls}}">${{arch.ewr}}%</span>
+          </div>
+        </div>
+      </div>`;
+    grid.appendChild(div);
+  }});
+}}
+
+// ── COLLECTION tab ──────────────────────────────────────────────────────────
+function deckCompletion(deck) {{
+  let have = 0, need = 0;
+  for (const c of deck.cards) {{
+    need += c.need;
+    have += Math.min(collection[c.id] || 0, c.need);
+  }}
+  return need === 0 ? 100 : Math.round(100 * have / need);
+}}
+
+function renderDeckList() {{
+  const el = document.getElementById('deck-list');
+  // Keep the + NEW DECK button at the bottom
+  const newBtn = document.getElementById('new-deck-btn');
+  el.innerHTML = '';
+  ARCHETYPES.forEach((deck, i) => {{
+    const pct = deckCompletion(deck);
+    const barClass = pct >= 80 ? '' : pct >= 40 ? 'mid' : 'low';
+    const div = document.createElement('div');
+    div.className = 'deck-item' + (i === activeDeckIdx ? ' active' : '');
+    const metaInfo = deck.custom
+      ? `<span>${{pct}}% BUILT</span><span style="color:var(--pink)">CUSTOM</span>`
+      : `<span>${{pct}}% BUILT</span><span>WR ${{(deck.win_rate*100).toFixed(1)}}%</span><span>META ${{(deck.meta_share*100).toFixed(1)}}%</span>`;
+    const delBtn = deck.custom
+      ? `<span class="deck-del" onclick="event.stopPropagation();deleteCustomDeck('${{deck.id}}')"
+           title="Delete deck" style="cursor:pointer;color:var(--dim);float:right;padding-left:6px">🗑</span>`
+      : '';
+    div.innerHTML = `
+      <div class="dname">${{delBtn}}${{deck.name.toUpperCase()}}</div>
+      <div class="xp-bar-wrap"><div class="xp-bar ${{barClass}}" style="width:${{pct}}%"></div></div>
+      <div class="deck-meta">${{metaInfo}}</div>`;
+    div.onclick = () => selectDeck(i);
+    el.appendChild(div);
+  }});
+  el.appendChild(newBtn);
+}}
+
+function selectDeck(idx) {{
+  activeDeckIdx = idx;
+  renderDeckList();
+  renderCards(ARCHETYPES[idx]);
+  document.getElementById('clear-deck-btn').disabled = false;
+}}
+
+function clearDeck() {{
+  if (activeDeckIdx < 0) return;
+  const deck = ARCHETYPES[activeDeckIdx];
+  deck.cards.forEach(c => {{ collection[c.id] = 0; }});
+  renderCards(deck);
+  renderDeckList();
+  updateTotal();
+  setStatus('DECK CLEARED — PRESS 💾 SAVE TO PERSIST', '');
+}}
+
+function renderCards(deck) {{
+  document.getElementById('deck-title').textContent = deck.name.toUpperCase();
+  const grid = document.getElementById('card-grid');
+  grid.innerHTML = '';
+  deck.cards.forEach(c => {{
+    const owned  = collection[c.id] || 0;
+    const cls    = owned >= c.need ? 'owned' : owned > 0 ? 'partial' : 'missing';
+    const sprite = TYPE_SPRITE[c.type] || '🃏';
+    const typeCls = TYPE_COLOR[c.type] || 'type-Trainer';
+    const div = document.createElement('div');
+    div.className = `card ${{cls}}`;
+    div.id = `card-${{c.id.replace(/[^a-z0-9]/gi,'_')}}`;
+    const imgHtml = c.img
+      ? `<img class="card-img" src="${{c.img}}"
+             onerror="this.style.display='none';this.nextElementSibling.style.display='flex';"
+             alt="${{c.name}}">
+         <div class="card-img-fallback" style="display:none">${{sprite}}</div>`
+      : `<div class="card-img-fallback">${{sprite}}</div>`;
+    div.innerHTML = `
+      <div class="card-type-badge ${{typeCls}}">${{c.type.toUpperCase()}}</div>
+      ${{imgHtml}}
+      <div class="card-name">${{c.name.toUpperCase()}}</div>
+      <div class="need-label">NEED: ${{c.need}}</div>
+      <div class="counter">
+        <button class="btn-counter" onclick="adjust('${{c.id}}',${{c.need}},-1)">−</button>
+        <span class="count-display" id="cnt-${{c.id.replace(/[^a-z0-9]/gi,'_')}}">${{owned}}</span>
+        <button class="btn-counter" onclick="adjust('${{c.id}}',${{c.need}},+1)">+</button>
+      </div>`;
+    grid.appendChild(div);
+  }});
+}}
+
+function adjust(cardId, need, delta) {{
+  const next = Math.max(0, Math.min((collection[cardId] || 0) + delta, 4));
+  collection[cardId] = next;
+  const safe = cardId.replace(/[^a-z0-9]/gi,'_');
+  const el = document.getElementById('cnt-' + safe);
+  if (el) el.textContent = next;
+  const cardEl = document.getElementById('card-' + safe);
+  if (cardEl) cardEl.className = 'card ' + (next >= need ? 'owned' : next > 0 ? 'partial' : 'missing');
+  if (activeDeckIdx >= 0) renderDeckList();
+  updateTotal();
+  setStatus('UNSAVED CHANGES — PRESS 💾 SAVE', '');
+}}
+
+// ── ANALYSIS tab (Shoppu Fighter layout) ────────────────────────────────────
+const ROLE_ORDER = {{ win_condition:0, engine:1, staple:2, tech:3, garnet:4 }};
+const ROLE_LABEL = {{ win_condition:'WIN CON', engine:'ENGINE', staple:'STAPLE', tech:'TECH', garnet:'GARNET' }};
+const ROLE_COLOR = {{
+  win_condition: 'var(--pink)',
+  engine:        'var(--blue)',
+  staple:        'var(--green)',
+  tech:          'var(--gold)',
+  garnet:        '#FF6B35',
+}};
+const AN_ROLES = ['win_condition','engine','staple','tech','garnet'];
+
+let anYourId     = '';
+let anOppId      = '';
+let anPicker     = null;
+let anRoleFilter = null;
+// anYourId / anOppId start empty — user must tap to select
+
+function roleFractions(cards) {{
+  const counts = {{ win_condition:0, engine:0, staple:0, tech:0, garnet:0 }};
+  if (!cards || !cards.length) return counts;
+  let total = 0;
+  for (const c of cards) {{
+    const r = c.role || 'garnet';
+    counts[r] = (counts[r] || 0) + (c.need || 1);
+    total += (c.need || 1);
+  }}
+  if (!total) return counts;
+  for (const r in counts) counts[r] = counts[r] / total * 100;
+  return counts;
+}}
+
+function anVerdictInfo(wr) {{
+  if (wr === undefined || wr === null) return {{ label:'— NO DATA', color:'var(--dim)', bgColor:'#ccc' }};
+  if (wr >= 0.55) return {{ label:'⬆ FAVORABLE',   color:'var(--green)', bgColor:'#E8F5E9' }};
+  if (wr <= 0.45) return {{ label:'⬇ UNFAVORABLE', color:'var(--pink)',  bgColor:'#FFE4EE' }};
+  return {{ label:'➔ EVEN MATCH', color:'var(--gold)', bgColor:'#FFF9E3' }};
+}}
+
+function anTop3Cards(deck) {{
+  // Return up to 3 unique Pokémon cards, sorted by role priority (win_condition first)
+  const seen = {{}};
+  const unique = [];
+  for (const c of (deck.cards || [])) {{
+    if (!seen[c.id] && c.type === 'Pokemon') {{ seen[c.id] = true; unique.push(c); }}
+  }}
+  unique.sort((a, b) => (ROLE_ORDER[a.role] ?? 4) - (ROLE_ORDER[b.role] ?? 4));
+  return unique.slice(0, 3);
+}}
+
+function anHandHtml(deck) {{
+  const cards = anTop3Cards(deck);
+  if (!cards.length) return '<div class="an-sc-hand-blank">🃏</div>';
+  return `<div class="an-sc-hand">${{
+    cards.map(c => `
+      <div class="an-sc-hand-card">
+        ${{c.img
+          ? `<img src="${{c.img}}" alt="${{c.name}}" onerror="this.parentNode.innerHTML='<div class=\\'an-sc-hand-blank\\'>🃏</div>'">`
+          : `<div class="an-sc-hand-blank">🃏</div>`
+        }}
+      </div>`).join('')
+  }}</div>`;
+}}
+
+function anDnaSvg(fracs) {{
+  return AN_ROLES.map(r => {{
+    const pct = fracs[r] || 0;
+    if (pct < 0.5) return '';
+    const col = ROLE_COLOR[r];
+    return `<div class="an-sc-dna-seg" style="width:${{pct.toFixed(1)}}%;background:${{col}}" title="${{ROLE_LABEL[r]}}: ${{pct.toFixed(0)}}%"></div>`;
+  }}).join('');
+}}
+
+function renderAnalysis() {{
+  anRenderRoot();
+}}
+
+function anRenderRoot() {{
+  const root = document.getElementById('an-root');
+  if (!root) return;
+
+  const yourDeck = anYourId ? ARCHETYPES.find(d => d.id === anYourId) : null;
+  const oppDeck  = anOppId  ? META_DATA.find(m => m.id === anOppId)  : null;
+  const bothSelected = !!(yourDeck && oppDeck);
+
+  // Always compute fracs (safe with empty arrays)
+  const yourFracs = roleFractions(yourDeck ? yourDeck.cards : []);
+  const oppArch   = oppDeck ? ARCHETYPES.find(d => d.id === oppDeck.id) : null;
+  const oppFracs  = roleFractions(oppArch ? oppArch.cards : []);
+
+  // Show selected deck(s) immediately — full analysis only needs both
+  if (!bothSelected) {{
+    const vi0 = {{ label: '? PENDING', color: 'var(--dim)', bgColor: 'var(--panel)' }};
+    const yourSide0 = yourDeck
+      ? `<div class="an-sc-body" onclick="anOpenPicker('your')">${{anHandHtml(yourDeck)}}<div class="an-sc-tag">◀ TAP</div></div>
+         <div class="an-sc-name">${{yourDeck.name}}</div>
+         <div class="an-sc-meta">META ${{(yourDeck.meta_share*100).toFixed(0)}}%</div>
+         <div class="an-sc-dna">${{anDnaSvg(yourFracs)}}</div>`
+      : `<div class="an-sc-body an-sc-empty" onclick="anOpenPicker('your')"><div class="an-sc-prompt">◀ TAP TO SELECT</div></div>
+         <div class="an-sc-name" style="color:var(--dim)">—</div>`;
+    const oppSide0 = (oppDeck && oppArch)
+      ? `<div class="an-sc-body" onclick="anOpenPicker('meta')">${{anHandHtml(oppArch)}}<div class="an-sc-tag right">TAP ▶</div></div>
+         <div class="an-sc-name">${{oppDeck.name}}</div>
+         <div class="an-sc-meta">META ${{oppDeck.meta_share.toFixed(0)}}%</div>
+         <div class="an-sc-dna">${{anDnaSvg(oppFracs)}}</div>`
+      : `<div class="an-sc-body an-sc-empty" onclick="anOpenPicker('meta')"><div class="an-sc-prompt">TAP TO SELECT ▶</div></div>
+         <div class="an-sc-name" style="color:var(--dim)">—</div>`;
+    root.innerHTML = `
+      <div class="an-header">
+        <div class="an-header-eyebrow">
+          <span class="an-route">// ROUTE 04</span>
+          <div class="an-rule"></div>
+          <span class="an-badge">◆ ANALYSIS · 分析</span>
+        </div>
+        <div class="an-headline">Pick your fighter.<span class="pink"> We do the math.</span></div>
+        <div class="an-subtitle">あなたの戦士を選べ・計算は任せろ</div>
+      </div>
+      <div class="an-scoreboard">
+        <div class="an-score-card-wrap">
+          <div class="an-sc-above">あなたのデッキ — YOUR DECK</div>
+          ${{yourSide0}}
+        </div>
+        <div class="an-verdict-core">
+          <div class="an-verdict-sticker" style="background:${{vi0.bgColor}};color:${{vi0.color}}">${{vi0.label}}</div>
+          <div class="an-verdict-label">➜ WIN RATE / 勝率 ←</div>
+          <div class="an-verdict-wr" style="color:${{vi0.color}}">—</div>
+          <div class="an-verdict-r2">SELECT BOTH DECKS</div>
+          <div class="an-verdict-dots">
+            <span style="animation-delay:0s"></span>
+            <span style="animation-delay:.15s"></span>
+            <span style="animation-delay:.30s"></span>
+          </div>
+        </div>
+        <div class="an-score-card-wrap right">
+          <div class="an-sc-above">敵のデッキ — META DECK</div>
+          ${{oppSide0}}
+        </div>
+      </div>`;
+    return;
+  }}
+
+  const rawWr    = (MATCHUP_DATA[yourDeck.id] || {{}})[oppDeck.id];
+  const vi       = anVerdictInfo(rawWr);
+  const wrStr    = rawWr !== undefined ? (rawWr * 100).toFixed(1) + '%' : 'N/A';
+
+  // ── Insight strip data ────────────────────────────────────────────────
+  const ad = ANALYSIS_DATA.find(a => a.name === yourDeck.id || a.name === yourDeck.name) || {{}};
+  const attr = (ad && ad.attribution) || {{}};
+  const worstRole = AN_ROLES.reduce((best, r) => (attr[r]||0) < (attr[best]||0) ? r : best, AN_ROLES[0]);
+  const worstVal  = Math.abs(attr[worstRole] || 0).toFixed(1);
+  const totalMissing = (ad && ad.total_missing) || 0;
+  const predWr = (ad && ad.predicted_wr) || '—';
+
+  // best opponent
+  const myMatchups = MATCHUP_DATA[yourDeck.id] || {{}};
+  let bestOpp = null, bestOppWr = -1;
+  META_DATA.forEach(m => {{
+    const w = myMatchups[m.id];
+    if (w !== undefined && w > bestOppWr) {{ bestOppWr = w; bestOpp = m; }}
+  }});
+  const bestOppStr = bestOpp ? `${{bestOpp.name.slice(0,20)}} (${{(bestOppWr*100).toFixed(0)}}%)` : '—';
+
+  // ── Nav stats ─────────────────────────────────────────────────────────
+  let favorable = 0, totalShare = 0, weightedWr = 0, matchupCount = 0;
+  META_DATA.forEach(m => {{
+    const w = myMatchups[m.id];
+    if (w === undefined) return;
+    if (w >= 0.52) favorable++;
+    totalShare  += m.meta_share;
+    weightedWr  += m.meta_share * w;
+    matchupCount++;
+  }});
+  const wwrStr = totalShare > 0 ? (weightedWr / totalShare * 100).toFixed(1) + '%' : '—';
+  const favStr = `${{favorable}}/${{matchupCount}}`;
+
+  // ── Nav pills ─────────────────────────────────────────────────────────
+  const pillsHtml = META_DATA.map(m => {{
+    const w = myMatchups[m.id];
+    const vi2 = anVerdictInfo(w);
+    const pillWrStr = w !== undefined ? (w*100).toFixed(0) + '%' : '—';
+    const isActive = m.id === oppDeck.id;
+    return `<div class="an-nav-pill${{isActive ? ' active' : ''}}" onclick="anSetOpp('${{m.id}}')">
+      ${{m.hero_img ? `<img src="${{m.hero_img}}" onerror="this.style.display='none'" alt="${{m.name}}">` : ''}}
+      <span class="pill-name">${{m.name.slice(0,12)}}</span>
+      <span class="pill-wr" style="color:${{isActive ? 'white' : vi2.color}}">${{pillWrStr}}</span>
+    </div>`;
+  }}).join('');
+
+  // ── Close the gap panel ───────────────────────────────────────────────
+  const neededByRole = {{ win_condition:0, engine:0, staple:0, tech:0, garnet:0 }};
+  const ownedByRole  = {{ win_condition:0, engine:0, staple:0, tech:0, garnet:0 }};
+  const seenR = {{}};
+  for (const c of yourDeck.cards) {{
+    if (seenR[c.id]) continue; seenR[c.id] = true;
+    const r = c.role || 'garnet';
+    neededByRole[r] += c.need;
+    ownedByRole[r]  += Math.min(collection[c.id] || 0, c.need);
+  }}
+
+  const roleRowsHtml = AN_ROLES.filter(r => neededByRole[r] > 0).map(r => {{
+    const pct = Math.round(ownedByRole[r] / neededByRole[r] * 100);
+    const col = ROLE_COLOR[r];
+    const attrVal = attr[r] || 0;
+    const attrSign = attrVal >= 0 ? '+' : '';
+    const attrColor = attrVal >= 0 ? 'var(--green)' : 'var(--red)';
+    const isActive = anRoleFilter === r;
+    const missingInRole = neededByRole[r] - ownedByRole[r];
+    return `<div class="an-role-row${{isActive ? ' active' : ''}}" onclick="anToggleRole('${{r}}')">
+      <div>
+        <span class="an-role-badge role-${{r}}" style="background:${{col}}">${{ROLE_LABEL[r]}}</span>
+      </div>
+      <div>
+        <div class="an-comp-bar-wrap">
+          <div class="an-comp-bar-fill" style="width:${{pct}}%;background:${{col}}"></div>
+        </div>
+        <div class="an-comp-bar-label">OWNED ${{pct}}%${{missingInRole > 0 ? ' · MISSING ' + missingInRole : ''}}</div>
+      </div>
+      <div class="an-role-attr" style="color:${{attrColor}}">${{attrSign}}${{attrVal.toFixed(1)}}%</div>
+      <div class="an-role-attr-label">MODEL /<br>CONTRIB.</div>
+    </div>`;
+  }}).join('');
+
+  // Missing cards filtered by role
+  const seen2 = {{}};
+  const allMissing = [];
+  for (const c of yourDeck.cards) {{
+    if (seen2[c.id]) continue; seen2[c.id] = true;
+    const short = c.need - (collection[c.id] || 0);
+    if (short > 0) allMissing.push({{ name: c.name, count: short, role: c.role || 'garnet', id: c.id, img: c.img || '' }});
+  }}
+  allMissing.sort((a, b) => (ROLE_ORDER[a.role] ?? 4) - (ROLE_ORDER[b.role] ?? 4));
+  const visibleMissing = anRoleFilter ? allMissing.filter(m => m.role === anRoleFilter) : allMissing;
+
+  const cardListHtml = visibleMissing.length
+    ? visibleMissing.map(m => `
+        <div class="an-acq-item">
+          ${{m.img ? `<img class="an-acq-thumb" src="${{m.img}}" onerror="this.style.display='none'" alt="${{m.name}}">` : `<div class="an-acq-thumb"></div>`}}
+          <span class="an-role-badge role-${{m.role}}" style="background:${{ROLE_COLOR[m.role]}}">${{ROLE_LABEL[m.role]}}</span>
+          <span class="an-acq-name">${{m.name.toUpperCase()}}</span>
+          <span class="an-acq-count">×${{m.count}}</span>
+        </div>`).join('')
+    : (allMissing.length === 0
+        ? `<div class="an-acq-empty">✓ NO MISSING CARDS · 揃っています</div>`
+        : `<div class="an-acq-empty">✓ NO MISSING ${{ROLE_LABEL[anRoleFilter]}} CARDS</div>`);
+
+  const filterBadge = anRoleFilter
+    ? `<span class="an-filter-badge">${{ROLE_LABEL[anRoleFilter]}}</span>` : '';
+
+  // ── Why panel divergence ──────────────────────────────────────────────
+  const activeFracs = [yourFracs, oppFracs];
+  const maxFrac = Math.max(...AN_ROLES.map(r => Math.max(yourFracs[r]||0, oppFracs[r]||0)));
+  const biggestDeltaRole = AN_ROLES.reduce((best, r) => {{
+    const delta = Math.abs((yourFracs[r]||0) - (oppFracs[r]||0));
+    const bestDelta = Math.abs((yourFracs[best]||0) - (oppFracs[best]||0));
+    return delta > bestDelta ? r : best;
+  }}, AN_ROLES[0]);
+  const biggestDelta = (yourFracs[biggestDeltaRole]||0) - (oppFracs[biggestDeltaRole]||0);
+  const calloutHtml = Math.abs(biggestDelta) >= 5
+    ? `<div class="an-callout"><span class="arrow">↳</span> Your deck runs <strong>${{Math.abs(biggestDelta).toFixed(0)}}% ${{biggestDelta > 0 ? 'more' : 'less'}}</strong> ${{biggestDeltaRole}} than theirs.</div>`
+    : '';
+  const divergRowsHtml = AN_ROLES.filter(r => (yourFracs[r]||0) + (oppFracs[r]||0) > 0.5).map(r => {{
+    const yf = yourFracs[r] || 0;
+    const mf = oppFracs[r] || 0;
+    const scale = maxFrac > 0 ? 60 / maxFrac : 1;
+    const yWidth = (yf * scale).toFixed(1);
+    const mWidth = (mf * scale).toFixed(1);
+    const delta = yf - mf;
+    const deltaStr = (delta >= 0 ? 'Δ +' : 'Δ ') + delta.toFixed(0) + '%';
+    const deltaCol = delta >= 0 ? 'var(--green)' : 'var(--red)';
+    const col = ROLE_COLOR[r];
+    return `<div class="an-diverg-row">
+      <div style="text-align:center"><span class="an-role-badge role-${{r}}" style="background:${{col}}">${{ROLE_LABEL[r]}}</span></div>
+      <div class="an-diverg-your"><div class="an-diverg-bar-y" style="width:${{yWidth}}%;background:${{col}}" title="Your: ${{yf.toFixed(0)}}%"></div></div>
+      <div class="an-diverg-meta"><div class="an-diverg-bar-m" style="width:${{mWidth}}%;background:${{col}}" title="Meta: ${{mf.toFixed(0)}}%"></div></div>
+      <div class="an-diverg-delta" style="color:${{deltaCol}}">${{deltaStr}}</div>
+    </div>`;
+  }}).join('');
+
+  // ── Field band ────────────────────────────────────────────────────────
+  const allMatchupsSorted = META_DATA.map(m => {{
+    const w = myMatchups[m.id];
+    return {{ m, w }};
+  }}).filter(x => x.w !== undefined).sort((a,b) => b.w - a.w);
+
+  const tierDefs = [
+    {{ id:'S', label:'S', minWr:0.60, color:'var(--green)' }},
+    {{ id:'A', label:'A', minWr:0.50, color:'var(--blue)' }},
+    {{ id:'B', label:'B', minWr:0.40, color:'var(--gold)' }},
+    {{ id:'C', label:'C', minWr:0,    color:'var(--pink)' }},
+  ];
+  const tierHtml = tierDefs.map(tier => {{
+    const nextMinWr = tier.id === 'S' ? 1 : tierDefs[tierDefs.indexOf(tier)-1].minWr;
+    const decksInTier = allMatchupsSorted.filter(x => {{
+      if (tier.id === 'S') return x.w >= 0.60;
+      if (tier.id === 'A') return x.w >= 0.50 && x.w < 0.60;
+      if (tier.id === 'B') return x.w >= 0.40 && x.w < 0.50;
+      return x.w < 0.40;
+    }});
+    if (!decksInTier.length) return '';
+    const deckCardsHtml = decksInTier.map(x => {{
+      const isActive = x.m.id === oppDeck.id;
+      const wrPct = (x.w * 100).toFixed(0) + '%';
+      return `<div class="an-tier-deck${{isActive ? ' active' : ''}}" onclick="anSetOpp('${{x.m.id}}')">
+        ${{x.m.hero_img ? `<img class="td-img" src="${{x.m.hero_img}}" onerror="this.style.display='none'" alt="${{x.m.name}}">` : `<div class="td-img" style="background:var(--bg-deep)"></div>`}}
+        <div class="td-body">
+          <div class="td-name">${{x.m.name.slice(0,14)}}</div>
+          <div class="td-wr" style="color:${{tier.color}}">${{wrPct}}</div>
+          <div class="td-meta">META ${{x.m.meta_share.toFixed(0)}}%</div>
+        </div>
+      </div>`;
+    }}).join('');
+    return `<div class="an-tier-row">
+      <div class="an-tier-badge" style="background:${{tier.color}}">
+        <span class="tier-letter">${{tier.label}}</span>
+        <span class="tier-sub">TIER</span>
+      </div>
+      <div class="an-tier-decks">${{deckCardsHtml}}</div>
+    </div>`;
+  }}).join('');
+
+  // ── Assemble root HTML ────────────────────────────────────────────────
+  root.innerHTML = `
+    <div class="an-header">
+      <div class="an-header-eyebrow">
+        <span class="an-route">// ROUTE 04</span>
+        <div class="an-rule"></div>
+        <span class="an-badge">◆ ANALYSIS · 分析</span>
+      </div>
+      <div class="an-headline">Pick your fighter.<span class="pink"> We do the math.</span></div>
+      <div class="an-subtitle">あなたの戦士を選べ・計算は任せろ</div>
+    </div>
+
+    <div class="an-scoreboard">
+      <div class="an-score-card-wrap">
+        <div class="an-sc-above">あなたのデッキ — YOUR DECK</div>
+        <div class="an-sc-body" onclick="anOpenPicker('your')">
+          ${{anHandHtml(yourDeck)}}
+          <div class="an-sc-tag">◀ TAP</div>
+        </div>
+        <div class="an-sc-name">${{yourDeck.name}}</div>
+        <div class="an-sc-meta">META ${{(yourDeck.meta_share*100).toFixed(0)}}%</div>
+        <div class="an-sc-dna">${{anDnaSvg(yourFracs)}}</div>
+      </div>
+
+      <div class="an-verdict-core">
+        <div class="an-verdict-sticker" style="background:${{vi.bgColor}};color:${{vi.color}}">${{vi.label}}</div>
+        <div class="an-verdict-label">➜ WIN RATE / 勝率 ←</div>
+        <div class="an-verdict-wr" style="color:${{vi.color}}">${{wrStr}}</div>
+        <div class="an-verdict-r2">R² = ${{REGRESSION && REGRESSION.r2 !== undefined ? REGRESSION.r2 : '—'}} · MODEL FIT</div>
+        <div class="an-verdict-dots">
+          <span style="animation-delay:0s"></span>
+          <span style="animation-delay:.15s"></span>
+          <span style="animation-delay:.30s"></span>
+        </div>
+      </div>
+
+      <div class="an-score-card-wrap right">
+        <div class="an-sc-above">敵のデッキ — META DECK</div>
+        <div class="an-sc-body" onclick="anOpenPicker('meta')">
+          ${{anHandHtml(oppArch || {{}})}}
+          <div class="an-sc-tag right">TAP ▶</div>
+        </div>
+        <div class="an-sc-name">${{oppDeck.name}}</div>
+        <div class="an-sc-meta">META ${{oppDeck.meta_share.toFixed(0)}}%</div>
+        <div class="an-sc-dna">${{anDnaSvg(oppFracs)}}</div>
+      </div>
+    </div>
+
+    <div class="an-insight">
+      <div class="an-insight-lead">◆ READ ME · 読むべし</div>
+      <div class="an-insight-items">
+        <div class="an-insight-item">Your <strong>${{ROLE_LABEL[worstRole]}}</strong> is dragging this matchup by ${{worstVal}}%.</div>
+        <span class="an-insight-div">│</span>
+        <div class="an-insight-item"><strong>Acquire ${{totalMissing}} card${{totalMissing!==1?'s':''}}</strong> → predicted WR ${{predWr}}%.</div>
+        <span class="an-insight-div">│</span>
+        <div class="an-insight-item"><strong>Easiest matchup:</strong> ${{bestOppStr}}</div>
+      </div>
+    </div>
+
+    <div class="an-nav">
+      <div class="an-nav-label">
+        <div class="big">MATCHUP</div>
+        <div class="small">NAVIGATOR<br>対戦相手選択</div>
+      </div>
+      <div class="an-nav-pills">${{pillsHtml}}</div>
+      <div class="an-nav-right">
+        <div style="color:var(--green)">FAVORABLE ${{favStr}}</div>
+        <div>WEIGHTED WR ${{wwrStr}}</div>
+      </div>
+    </div>
+
+    <div class="an-workspace">
+      <div class="an-panel">
+        <div class="an-panel-eyebrow">HOW TO WIN THIS MATCHUP</div>
+        <div class="an-panel-title">CLOSE THE GAP</div>
+        <span class="an-panel-subtitle">差を埋めよ</span>
+        ${{roleRowsHtml}}
+        <div class="an-card-list-header">
+          <div class="an-card-list-title">CARDS TO ACQUIRE ${{allMissing.length ? '(' + allMissing.length + ')' : ''}}</div>
+          ${{filterBadge}}
+          ${{anRoleFilter ? `<button class="an-clear-btn" onclick="anToggleRole(null)">✕ CLEAR</button>` : ''}}
+        </div>
+        ${{cardListHtml}}
+      </div>
+
+      <div class="an-panel">
+        <div class="an-panel-eyebrow">ROLE DNA — COMPOSITION DIVERGENCE</div>
+        <div class="an-panel-title">WHY</div>
+        <span class="an-panel-subtitle">なぜ</span>
+        ${{calloutHtml}}
+        <div class="an-diverg">
+          <div class="an-diverg-header">
+            <span style="text-align:right">YOUR / あなた</span>
+            <span style="text-align:center">← LEFT</span>
+            <span style="text-align:center">RIGHT →</span>
+            <span>META / 敵</span>
+          </div>
+          ${{divergRowsHtml}}
+        </div>
+      </div>
+    </div>
+
+    <div class="an-field">
+      <div class="an-field-eyebrow">FIELD VIEW</div>
+      <div class="an-field-title">FULL MATCHUP SWEEP</div>
+      <span class="an-field-subtitle">全アーキタイプ対戦成績 — SORTED BY WIN RATE INTO TIERS</span>
+      ${{tierHtml || '<div style="font-family:var(--pixel);font-size:9px;color:var(--dim)">NO MATCHUP DATA</div>'}}
+    </div>`;
+}}
+
+function anSetOpp(id) {{
+  anOppId = id;
+  anRenderRoot();
+  document.getElementById('analysis-pane').scrollTop = 0;
+}}
+
+function anToggleRole(r) {{
+  anRoleFilter = anRoleFilter === r ? null : r;
+  anRenderRoot();
+}}
+
+function anOpenPicker(side) {{
+  anPicker = side;
+  const overlay = document.getElementById('an-picker-overlay');
+  const grid    = document.getElementById('an-picker-grid');
+  const sub     = document.getElementById('an-picker-sub');
+  sub.textContent = side === 'your' ? 'YOUR DECK' : 'META DECK';
+  const decks = side === 'your' ? ARCHETYPES : META_DATA;
+  const selectedId = side === 'your' ? anYourId : anOppId;
+  grid.innerHTML = decks.map(d => {{
+    // For meta side, look up the ARCHETYPES entry to get card images
+    const deckWithCards = side === 'your' ? d : (ARCHETYPES.find(a => a.id === d.id) || {{}});
+    const metaStr = side === 'meta' ? `META ${{d.meta_share.toFixed(0)}}%` : (d.meta_share > 0 ? `META ${{(d.meta_share*100).toFixed(0)}}%` : '');
+    const isSelected = d.id === selectedId;
+    // Build mini 3-card fan
+    const top3 = anTop3Cards(deckWithCards);
+    const cls = ['hc-left','hc-mid','hc-right'];
+    const positions = top3.length === 1 ? ['hc-mid'] : top3.length === 2 ? ['hc-left','hc-right'] : cls;
+    const fanHtml = top3.length
+      ? `<div class="an-picker-hand">${{top3.map((c,i) =>
+          `<div class="an-picker-hcard ${{positions[i]}}">${{c.img ? `<img src="${{c.img}}" alt="${{c.name}}" onerror="this.style.display='none'">` : ''}}</div>`
+        ).join('')}}</div>`
+      : `<div class="an-picker-hand" style="background:var(--bg-deep)"></div>`;
+    return `<div class="an-picker-card${{isSelected ? ' selected' : ''}}" onclick="anPickerSelect('${{d.id}}')">
+      ${{fanHtml}}
+      <div class="an-picker-name">${{d.name}}</div>
+      ${{metaStr ? `<div class="an-picker-meta">${{metaStr}}</div>` : ''}}
+    </div>`;
+  }}).join('');
+  overlay.classList.add('open');
+}}
+
+function anPickerSelect(id) {{
+  if (anPicker === 'your') anYourId = id;
+  else                     anOppId  = id;
+  anRoleFilter = null;
+  anClosePicker(null);
+  anRenderRoot();
+}}
+
+function anClosePicker(e) {{
+  if (e && e.target !== document.getElementById('an-picker-overlay')) return;
+  document.getElementById('an-picker-overlay').classList.remove('open');
+  anPicker = null;
+}}
+
+// ── NEW DECK modal ────────────────────────────────────────────────────────────
+let draftDeck = {{ name: '', cards: [] }}; // cards: {{id,name,type,img,count}}
+
+function openNewDeck() {{
+  draftDeck = {{ name: '', cards: [] }};
+  document.getElementById('nd-name').value = '';
+  document.getElementById('nd-search').value = '';
+  document.getElementById('nd-err').textContent = '';
+  document.getElementById('nd-overlay').classList.add('open');
+  ndSearch();
+  renderDraft();
+}}
+
+function closeNewDeck() {{
+  document.getElementById('nd-overlay').classList.remove('open');
+}}
+
+function ndSearch() {{
+  const q = document.getElementById('nd-search').value.toLowerCase();
+  const results = CATALOG_DATA
+    .filter(c => !q || c.name.toLowerCase().includes(q))
+    .slice(0, 40);
+  const el = document.getElementById('nd-results');
+  el.innerHTML = '';
+  if (!results.length) {{
+    el.innerHTML = '<div style="padding:12px;font-size:7px;color:var(--dim)">NO CARDS FOUND</div>';
+    return;
+  }}
+  results.forEach(c => {{
+    const div = document.createElement('div');
+    div.className = 'nd-result';
+    div.innerHTML = `
+      ${{c.img
+        ? `<img class="nd-result-img" src="${{c.img}}"
+               onerror="this.style.display='none'" alt="${{c.name}}">`
+        : `<div class="nd-result-img" style="display:flex;align-items:center;justify-content:center;font-size:16px">
+             ${{TYPE_SPRITE[c.type]||'🃏'}}</div>`}}
+      <div class="nd-result-info">
+        <div class="nd-result-name">${{c.name.toUpperCase()}}</div>
+        <div class="nd-result-sub">${{c.type.toUpperCase()}} · ${{c.set}}</div>
+      </div>
+      <button class="nd-add-btn" onclick="ndAddCard('${{c.id}}','${{c.name.replace(/'/g,"\\\\'")}}}','${{c.type}}','${{c.img || ''}}')">ADD</button>`;
+    el.appendChild(div);
+  }});
+}}
+
+function ndAddCard(id, name, type, img) {{
+  const existing = draftDeck.cards.find(c => c.id === id);
+  const totalCopies = draftDeck.cards.reduce((s,c) => s + c.count, 0);
+  if (existing) {{
+    if (existing.count >= 2) {{ setNdErr('MAX 2 COPIES PER CARD'); return; }}
+    existing.count++;
+  }} else {{
+    if (totalCopies >= 20) {{ setNdErr('DECK IS FULL (20 CARDS)'); return; }}
+    draftDeck.cards.push({{ id, name, type, img, count: 1 }});
+  }}
+  setNdErr('');
+  renderDraft();
+}}
+
+function ndAdjust(id, delta) {{
+  const card = draftDeck.cards.find(c => c.id === id);
+  if (!card) return;
+  const totalOther = draftDeck.cards.filter(c=>c.id!==id).reduce((s,c)=>s+c.count,0);
+  if (delta > 0 && card.count >= 2) {{ setNdErr('MAX 2 COPIES PER CARD'); return; }}
+  if (delta > 0 && totalOther + card.count >= 20) {{ setNdErr('DECK IS FULL (20 CARDS)'); return; }}
+  card.count += delta;
+  if (card.count <= 0) draftDeck.cards = draftDeck.cards.filter(c => c.id !== id);
+  setNdErr('');
+  renderDraft();
+}}
+
+function renderDraft() {{
+  const total = draftDeck.cards.reduce((s,c) => s+c.count, 0);
+  document.getElementById('nd-draft-count').textContent = `${{total}} / 20 CARDS`;
+  document.getElementById('nd-draft-count').style.color = total >= 20 ? 'var(--green)' : 'var(--text)';
+  const el = document.getElementById('nd-draft-list');
+  el.innerHTML = '';
+  if (!draftDeck.cards.length) {{
+    el.innerHTML = '<div style="padding:12px;font-size:7px;color:var(--dim)">ADD CARDS FROM THE LEFT</div>';
+    return;
+  }}
+  draftDeck.cards.forEach(c => {{
+    const div = document.createElement('div');
+    div.className = 'nd-draft-item';
+    div.innerHTML = `
+      <div class="nd-draft-name">${{c.name.toUpperCase()}}</div>
+      <button class="nd-draft-btn" onclick="ndAdjust('${{c.id}}',-1)">−</button>
+      <span class="nd-draft-cnt">${{c.count}}</span>
+      <button class="nd-draft-btn" onclick="ndAdjust('${{c.id}}',+1)">+</button>`;
+    el.appendChild(div);
+  }});
+}}
+
+function setNdErr(msg) {{
+  document.getElementById('nd-err').textContent = msg;
+}}
+
+async function saveDraft() {{
+  const name = document.getElementById('nd-name').value.trim();
+  if (!name) {{ setNdErr('ENTER A DECK NAME'); return; }}
+  if (!draftDeck.cards.length) {{ setNdErr('ADD AT LEAST ONE CARD'); return; }}
+  const total = draftDeck.cards.reduce((s,c) => s+c.count, 0);
+  if (total > 20) {{ setNdErr('TOO MANY CARDS (MAX 20)'); return; }}
+
+  const newDeck = {{
+    id: 'custom-' + Date.now(),
+    name,
+    meta_share: 0, win_rate: 0, custom: true,
+    cards: draftDeck.cards.map(c => ({{ id: c.id, count: c.count }})),
+  }};
+
+  // Add to ARCHETYPES in memory
+  ARCHETYPES.push({{
+    ...newDeck,
+    cards: draftDeck.cards.map(c => ({{
+      id: c.id, name: c.name, type: c.type,
+      need: c.count, have: collection[c.id] || 0, img: c.img,
+    }})),
+  }});
+
+  // Persist all custom decks
+  const customDecks = ARCHETYPES.filter(d => d.custom).map(d => ({{
+    id: d.id, name: d.name,
+    cards: d.cards.map(c => ({{ id: c.id, count: c.need }})),
+  }}));
+  try {{
+    await fetch('/save-decks', {{
+      method: 'POST',
+      headers: {{'Content-Type':'application/json'}},
+      body: JSON.stringify(customDecks),
+    }});
+  }} catch(e) {{}}
+
+  // Auto-sync collection: bump owned count up to at least what the deck needs
+  let collectionChanged = false;
+  for (const c of draftDeck.cards) {{
+    const needed = c.count;
+    if ((collection[c.id] || 0) < needed) {{
+      collection[c.id] = needed;
+      collectionChanged = true;
+    }}
+  }}
+  if (collectionChanged) {{
+    try {{
+      await fetch('/save', {{
+        method: 'POST',
+        headers: {{'Content-Type':'application/json'}},
+        body: JSON.stringify(collection),
+      }});
+    }} catch(e) {{}}
+  }}
+
+  closeNewDeck();
+  renderDeckList();
+  setStatus(collectionChanged ? '✔ DECK SAVED — COLLECTION UPDATED AUTOMATICALLY!' : '✔ DECK SAVED!', 'ok');
+}}
+
+async function deleteCustomDeck(deckId) {{
+  const idx = ARCHETYPES.findIndex(d => d.id === deckId);
+  if (idx < 0) return;
+  ARCHETYPES.splice(idx, 1);
+  if (activeDeckIdx === idx) {{
+    activeDeckIdx = -1;
+    document.getElementById('deck-title').textContent = '◄ SELECT A DECK ►';
+    document.getElementById('card-grid').innerHTML = '';
+    document.getElementById('clear-deck-btn').disabled = true;
+  }} else if (activeDeckIdx > idx) {{
+    activeDeckIdx--;
+  }}
+  const customDecks = ARCHETYPES.filter(d => d.custom).map(d => ({{
+    id: d.id, name: d.name,
+    cards: d.cards.map(c => ({{ id: c.id, count: c.need }})),
+  }}));
+  try {{
+    await fetch('/save-decks', {{
+      method: 'POST',
+      headers: {{'Content-Type':'application/json'}},
+      body: JSON.stringify(customDecks),
+    }});
+  }} catch(e) {{}}
+  renderDeckList();
+  setStatus('DECK DELETED', '');
+}}
+
+// ── CATALOG tab ──────────────────────────────────────────────────────────────
+let catInitialised = false;
+
+function initCatalog() {{
+  if (!catInitialised) {{
+    // Populate set dropdown from unique set values
+    const sets = [...new Set(CATALOG_DATA.map(c => c.set).filter(Boolean))].sort();
+    const sel = document.getElementById('cat-set');
+    sets.forEach(s => {{
+      const opt = document.createElement('option');
+      opt.value = s; opt.textContent = s;
+      sel.appendChild(opt);
+    }});
+    catInitialised = true;
+  }}
+  filterCatalog();
+}}
+
+function setCatType(t) {{
+  catType = t;
+  document.querySelectorAll('.cat-type-btn').forEach(b => {{
+    b.classList.toggle('active',
+      (t === '' && b.textContent === 'ALL') ||
+      b.textContent === t.toUpperCase()
+    );
+  }});
+  filterCatalog();
+}}
+
+function filterCatalog() {{
+  const query = (document.getElementById('cat-search').value || '').toLowerCase();
+  const set   = document.getElementById('cat-set').value;
+  catFiltered = CATALOG_DATA.filter(c =>
+    (!query  || c.name.toLowerCase().includes(query)) &&
+    (!set    || c.set === set) &&
+    (!catType || c.type === catType)
+  );
+  catPage = 0;
+  renderCatalogPage(true);
+}}
+
+function renderCatalogPage(reset) {{
+  const grid = document.getElementById('catalog-grid');
+  if (reset) grid.innerHTML = '';
+
+  const start = catPage * CAT_PAGE_SIZE;
+  const slice = catFiltered.slice(start, start + CAT_PAGE_SIZE);
+
+  slice.forEach(c => {{
+    const owned   = collection[c.id] || 0;
+    const cls     = owned >= 1 ? 'owned' : 'missing';
+    const sprite  = TYPE_SPRITE[c.type] || '🃏';
+    const typeCls = TYPE_COLOR[c.type]  || 'type-Trainer';
+    const safe    = c.id.replace(/[^a-z0-9]/gi, '_');
+    const div = document.createElement('div');
+    div.className = `card cat-card ${{cls}}`;
+    div.id = `cat-card-${{safe}}`;
+    const imgHtml = c.img
+      ? `<img class="card-img" src="${{c.img}}"
+             onerror="this.style.display='none';this.nextElementSibling.style.display='flex';"
+             alt="${{c.name}}">
+         <div class="card-img-fallback" style="display:none">${{sprite}}</div>`
+      : `<div class="card-img-fallback">${{sprite}}</div>`;
+    const ownedBadge = owned >= 1
+      ? `<div class="owned-badge" id="cat-badge-${{safe}}">✓ OWNED</div>`
+      : `<div class="owned-badge" id="cat-badge-${{safe}}" style="display:none">✓ OWNED</div>`;
+    div.innerHTML = `
+      ${{ownedBadge}}
+      <div class="card-type-badge ${{typeCls}}">${{c.type.toUpperCase()}}</div>
+      ${{imgHtml}}
+      <div class="card-name">${{c.name.toUpperCase()}}</div>
+      <div class="need-label">${{c.set}} · ${{c.id.split('-')[1] || ''}}</div>
+      <div class="counter">
+        <button class="btn-counter" onclick="adjustCat('${{c.id}}',-1)">−</button>
+        <span class="count-display" id="cat-cnt-${{safe}}">${{owned}}</span>
+        <button class="btn-counter" onclick="adjustCat('${{c.id}}',+1)">+</button>
+      </div>`;
+    grid.appendChild(div);
+  }});
+
+  const shown = Math.min((catPage + 1) * CAT_PAGE_SIZE, catFiltered.length);
+  document.getElementById('cat-count').textContent =
+    `SHOWING ${{shown}} OF ${{catFiltered.length}} CARDS`;
+  const loadMore = document.getElementById('cat-load-more');
+  loadMore.disabled = shown >= catFiltered.length;
+  catPage++;
+}}
+
+function loadMoreCatalog() {{
+  renderCatalogPage(false);
+}}
+
+function adjustCat(cardId, delta) {{
+  const next = Math.max(0, Math.min((collection[cardId] || 0) + delta, 4));
+  collection[cardId] = next;
+  const safe = cardId.replace(/[^a-z0-9]/gi, '_');
+
+  // Update catalog tab display
+  const catCnt = document.getElementById('cat-cnt-' + safe);
+  if (catCnt) catCnt.textContent = next;
+  const catBadge = document.getElementById('cat-badge-' + safe);
+  if (catBadge) catBadge.style.display = next >= 1 ? '' : 'none';
+  const catCard = document.getElementById('cat-card-' + safe);
+  if (catCard) catCard.className = 'card cat-card ' + (next >= 1 ? 'owned' : 'missing');
+
+  // Sync collection tab if it has this card displayed
+  const deckCnt = document.getElementById('cnt-' + safe);
+  if (deckCnt) deckCnt.textContent = next;
+
+  if (activeDeckIdx >= 0) renderDeckList();
+  updateTotal();
+  setStatus('UNSAVED CHANGES — PRESS 💾 SAVE', '');
+}}
+
+// ── Refresh data ─────────────────────────────────────────────────────────────
+async function refreshData() {{
+  const btn = document.getElementById('refresh-btn');
+  btn.disabled = true; btn.textContent = '...';
+  setStatus('REFRESHING TOURNAMENT DATA FROM LIMITLESS...', '');
+  try {{
+    const resp = await fetch('/refresh', {{ method: 'POST' }});
+    if (!resp.ok) throw new Error('server');
+    const data = await resp.json();
+    if (data.meta)       META_DATA.splice(0, META_DATA.length, ...data.meta);
+    if (data.analysis)   ANALYSIS_DATA = data.analysis;
+    if (data.matchup)    MATCHUP_DATA  = data.matchup;
+    if (data.regression) REGRESSION    = data.regression;
+    if (data.decks) {{
+      ARCHETYPES.splice(0, ARCHETYPES.length, ...data.decks);
+      activeDeckIdx = -1;
+    }}
+    if (activeTab === 'meta')       renderMeta();
+    if (activeTab === 'collection') renderDeckList();
+    if (activeTab === 'analysis')   renderAnalysis();
+    setStatus('✔ DATA REFRESHED SUCCESSFULLY!', 'ok');
+  }} catch(e) {{
+    setStatus('✘ REFRESH FAILED — CHECK YOUR CONNECTION', 'err');
+  }}
+  btn.disabled = false; btn.textContent = '⟳';
+}}
+
+// ── Save ─────────────────────────────────────────────────────────────────────
+async function saveCollection() {{
+  const btn = document.getElementById('save-btn');
+  btn.textContent = 'SAVING...';
+  try {{
+    const resp = await fetch('/save', {{
+      method: 'POST',
+      headers: {{'Content-Type':'application/json'}},
+      body: JSON.stringify(collection),
+    }});
+    if (resp.ok) {{
+      setStatus('✔ COLLECTION SAVED!', 'ok');
+      btn.textContent = '✔ SAVED!';
+      setTimeout(() => {{ btn.textContent = '💾 SAVE'; }}, 2000);
+      if (activeTab === 'analysis') renderAnalysis();
+    }} else throw new Error();
+  }} catch(e) {{
+    setStatus('✘ SAVE FAILED — IS THE SERVER RUNNING?', 'err');
+    btn.textContent = '💾 SAVE';
+  }}
+}}
+
+function setStatus(msg, cls) {{
+  const el = document.getElementById('status-msg');
+  el.textContent = msg;
+  el.className = cls || '';
+  clearTimeout(el._t);
+  if (msg) {{
+    el.classList.add('visible');
+    el._t = setTimeout(() => el.classList.remove('visible'), 3500);
+  }}
+}}
+
+function updateTotal() {{
+  document.getElementById('total-count').textContent =
+    Object.values(collection).reduce((a,b) => a+b, 0);
+}}
+
+// ── Boot ──────────────────────────────────────────────────────────────────────
+function bootSequence() {{
+  const bar = document.getElementById('boot-bar');
+  let pct = 0;
+  const iv = setInterval(() => {{
+    pct += Math.random() * 8 + 2;
+    bar.style.width = Math.min(pct, 100) + '%';
+    if (pct >= 100) {{
+      clearInterval(iv);
+      setTimeout(() => {{
+        document.getElementById('boot').style.display = 'none';
+        document.getElementById('main-ui').style.display = 'flex';
+        renderMeta();
+        setStatus('SELECT A TAB TO EXPLORE', '');
+      }}, 300);
+    }}
+  }}, 40);
+}}
+
+updateTotal();
+bootSequence();
+</script>
+</body>
+</html>"""  # noqa: E501
+
+
+class _Handler(http.server.BaseHTTPRequestHandler):
+    html: str = ""
+    collection_path: Path = Path("my_collection.json")
+    custom_decks_path: Path = Path("my_decks.json")
+    outputs_dir: Path = Path("outputs")
+    reload_fn = None  # callable() -> dict {decks, meta, analysis}
+
+    def do_GET(self) -> None:  # noqa: N802
+        if self.path in ("/", ""):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(self.__class__.html.encode())
+
+        elif self.path.startswith("/charts/"):
+            fname = self.path[len("/charts/"):]
+            fpath = self.__class__.outputs_dir / fname
+            if fpath.exists() and fpath.suffix in (".png", ".jpg", ".svg"):
+                mime, _ = mimetypes.guess_type(str(fpath))
+                self.send_response(200)
+                self.send_header("Content-Type", mime or "image/png")
+                self.end_headers()
+                self.wfile.write(fpath.read_bytes())
+            else:
+                self.send_response(404)
+                self.end_headers()
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def do_POST(self) -> None:  # noqa: N802
+        length = int(self.headers.get("Content-Length", 0))
+        body = self.rfile.read(length)
+
+        if self.path == "/save":
+            try:
+                data = json.loads(body)
+                with open(self.__class__.collection_path, "w") as f:
+                    json.dump(data, f, indent=2)
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b"OK")
+            except Exception:
+                self.send_response(500)
+                self.end_headers()
+
+        elif self.path == "/refresh":
+            fn = self.__class__.reload_fn
+            if fn is None:
+                self.send_response(501)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(b'{"error":"reload not configured"}')
+                return
+            try:
+                new_page_data = fn()
+                payload = json.dumps(new_page_data).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(payload)
+            except Exception as exc:
+                self.send_response(500)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"error": str(exc)}).encode())
+
+        elif self.path == "/save-decks":
+            try:
+                data = json.loads(body)
+                with open(self.__class__.custom_decks_path, "w") as f:
+                    json.dump(data, f, indent=2)
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b"OK")
+            except Exception:
+                self.send_response(500)
+                self.end_headers()
+
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def log_message(self, fmt: str, *args) -> None:  # noqa: ANN002
+        pass  # suppress access logs
+
+
+def launch_collection_browser(
+    archetypes: list[dict],
+    catalog: dict[str, Card],
+    collection_path: Path,
+    ewrs: list[float] | None = None,
+    attributions: list[dict] | None = None,
+    meta_decks: list | None = None,
+    outputs_dir: Path | None = None,
+    reload_fn=None,
+    matchup_matrix: dict | None = None,
+    role_map: dict | None = None,
+    regression=None,
+) -> None:
+    """Start a local server and open the full retro browser UI."""
+    ewrs = ewrs or []
+    attributions = attributions or []
+    meta_decks = meta_decks or []
+
+    my_cards: dict = {}
+    if collection_path.exists():
+        with open(collection_path) as f:
+            my_cards = json.load(f)
+
+    custom_decks_path = collection_path.parent / "my_decks.json"
+    custom_decks: list = []
+    if custom_decks_path.exists():
+        with open(custom_decks_path) as f:
+            custom_decks = json.load(f)
+
+    page_data = _prepare_page_data(
+        archetypes, catalog, my_cards, ewrs, attributions, meta_decks, custom_decks,
+        matchup_matrix=matchup_matrix,
+        role_map=role_map,
+        regression=regression,
+    )
+    _Handler.html = _build_html(page_data, my_cards)
+    _Handler.collection_path = collection_path
+    _Handler.custom_decks_path = custom_decks_path
+    _Handler.outputs_dir = outputs_dir or Path("outputs")
+    _Handler.reload_fn = reload_fn
+
+    class _ReusingServer(socketserver.TCPServer):
+        allow_reuse_address = True
+
+    with _ReusingServer(("", _PORT), _Handler) as httpd:
+        url = f"http://localhost:{_PORT}"
+        print(f"\n  Opening browser UI at {url}")
+        print("  Press ENTER in this terminal to close.\n")
+        webbrowser.open(url)
+
+        t = threading.Thread(target=httpd.serve_forever, daemon=True)
+        t.start()
+        try:
+            input()
+        except (KeyboardInterrupt, EOFError):
+            pass
+        httpd.shutdown()
+        print("  Browser closed.\n")
