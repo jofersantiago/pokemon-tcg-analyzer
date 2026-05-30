@@ -753,43 +753,55 @@ def _build_html(page_data: dict, my_cards: dict) -> str:  # noqa: E501
     text-align: center; line-height: 2.5;
   }}
 
-  /* Why panel */
+  /* Why panel — two-column internal layout */
+  .an-why-body {{
+    display: grid; grid-template-columns: 1fr 1.8fr;
+    gap: 16px; margin-top: 4px;
+  }}
   .an-callout {{
     background: white; border: 2px solid var(--border);
-    padding: 14px; margin-bottom: 16px;
-    font-family: var(--mono); font-size: 14px;
+    padding: 16px; font-family: var(--mono); font-size: 14px;
+    display: flex; flex-direction: column; gap: 10px;
+  }}
+  .an-callout-title {{
+    font-family: var(--pixel); font-size: 9px; color: var(--dim);
+    border-bottom: 1px solid var(--border); padding-bottom: 8px;
   }}
   .an-callout .arrow {{ color: var(--pink); }}
   .an-diverg {{
     background: white; border: 2px solid var(--border); padding: 16px;
   }}
   .an-diverg-header {{
-    display: grid; grid-template-columns: 90px 1fr 1fr 90px;
-    gap: 8px; margin-bottom: 8px;
+    display: grid; grid-template-columns: 90px 1fr 1fr 64px;
+    gap: 8px; margin-bottom: 10px;
   }}
   .an-diverg-header span {{
     font-family: var(--pixel); font-size: 8px; color: var(--dim);
   }}
   .an-diverg-row {{
-    display: grid; grid-template-columns: 90px 1fr 1fr 90px;
-    gap: 8px; align-items: center; margin-bottom: 6px;
+    display: grid; grid-template-columns: 90px 1fr 1fr 64px;
+    gap: 8px; align-items: center; margin-bottom: 8px;
   }}
-  .an-diverg-your {{
-    position: relative; height: 20px;
+  .an-diverg-bar-col {{
+    display: flex; align-items: center; gap: 6px;
   }}
-  .an-diverg-bar-y {{
-    position: absolute; right: 0; height: 100%; top: 0;
-    min-width: 2px;
+  .an-diverg-bar-wrap {{
+    flex: 1; height: 20px; background: var(--bg-deep);
+    border: 1px solid var(--border); overflow: hidden; position: relative;
   }}
-  .an-diverg-meta {{
-    position: relative; height: 20px;
+  .an-diverg-bar-fill {{
+    height: 100%; min-width: 2px; transition: width .4s ease;
   }}
-  .an-diverg-bar-m {{
-    position: absolute; left: 0; height: 100%; top: 0;
-    min-width: 2px; opacity: .8;
+  .an-diverg-pct {{
+    font-family: var(--pixel); font-size: 9px; color: var(--dim);
+    white-space: nowrap; min-width: 28px; text-align: right;
   }}
   .an-diverg-delta {{
-    font-family: var(--pixel); font-size: 10px; text-align: center;
+    font-family: var(--pixel); font-size: 10px; text-align: right;
+  }}
+  /* Cards to acquire grid */
+  .an-acq-grid {{
+    display: grid; grid-template-columns: 1fr 1fr; gap: 8px;
   }}
 
   /* Field band */
@@ -1630,13 +1642,15 @@ function anRenderRoot() {{
   const visibleMissing = anRoleFilter ? allMissing.filter(m => m.role === anRoleFilter) : allMissing;
 
   const cardListHtml = visibleMissing.length
-    ? visibleMissing.map(m => `
+    ? `<div class="an-acq-grid">${{visibleMissing.map(m => `
         <div class="an-acq-item">
           ${{m.img ? `<img class="an-acq-thumb" src="${{m.img}}" onerror="this.style.display='none'" alt="${{m.name}}">` : `<div class="an-acq-thumb"></div>`}}
-          <span class="an-role-badge role-${{m.role}}" style="background:${{ROLE_COLOR[m.role]}}">${{ROLE_LABEL[m.role]}}</span>
-          <span class="an-acq-name">${{m.name.toUpperCase()}}</span>
+          <div style="flex:1;min-width:0">
+            <span class="an-role-badge role-${{m.role}}" style="background:${{ROLE_COLOR[m.role]}}">${{ROLE_LABEL[m.role]}}</span>
+            <div class="an-acq-name">${{m.name}}</div>
+          </div>
           <span class="an-acq-count">×${{m.count}}</span>
-        </div>`).join('')
+        </div>`).join('')}}</div>`
     : (allMissing.length === 0
         ? `<div class="an-acq-empty">✓ NO MISSING CARDS · 揃っています</div>`
         : `<div class="an-acq-empty">✓ NO MISSING ${{ROLE_LABEL[anRoleFilter]}} CARDS</div>`);
@@ -1654,22 +1668,29 @@ function anRenderRoot() {{
   }}, AN_ROLES[0]);
   const biggestDelta = (yourFracs[biggestDeltaRole]||0) - (oppFracs[biggestDeltaRole]||0);
   const calloutHtml = Math.abs(biggestDelta) >= 5
-    ? `<div class="an-callout"><span class="arrow">↳</span> Your deck runs <strong>${{Math.abs(biggestDelta).toFixed(0)}}% ${{biggestDelta > 0 ? 'more' : 'less'}}</strong> ${{biggestDeltaRole}} than theirs.</div>`
+    ? `<span class="arrow">↳</span> Your deck runs <strong>${{Math.abs(biggestDelta).toFixed(0)}}% ${{biggestDelta > 0 ? 'more' : 'less'}}</strong> ${{biggestDeltaRole}} than theirs.`
     : '';
   const divergRowsHtml = AN_ROLES.filter(r => (yourFracs[r]||0) + (oppFracs[r]||0) > 0.5).map(r => {{
     const yf = yourFracs[r] || 0;
     const mf = oppFracs[r] || 0;
-    const scale = maxFrac > 0 ? 60 / maxFrac : 1;
-    const yWidth = (yf * scale).toFixed(1);
-    const mWidth = (mf * scale).toFixed(1);
     const delta = yf - mf;
-    const deltaStr = (delta >= 0 ? 'Δ +' : 'Δ ') + delta.toFixed(0) + '%';
+    const deltaStr = (delta >= 0 ? '+' : '') + delta.toFixed(0) + '%';
     const deltaCol = delta >= 0 ? 'var(--green)' : 'var(--red)';
     const col = ROLE_COLOR[r];
     return `<div class="an-diverg-row">
-      <div style="text-align:center"><span class="an-role-badge role-${{r}}" style="background:${{col}}">${{ROLE_LABEL[r]}}</span></div>
-      <div class="an-diverg-your"><div class="an-diverg-bar-y" style="width:${{yWidth}}%;background:${{col}}" title="Your: ${{yf.toFixed(0)}}%"></div></div>
-      <div class="an-diverg-meta"><div class="an-diverg-bar-m" style="width:${{mWidth}}%;background:${{col}}" title="Meta: ${{mf.toFixed(0)}}%"></div></div>
+      <div><span class="an-role-badge role-${{r}}" style="background:${{col}}">${{ROLE_LABEL[r]}}</span></div>
+      <div class="an-diverg-bar-col">
+        <div class="an-diverg-bar-wrap">
+          <div class="an-diverg-bar-fill" style="width:${{yf.toFixed(0)}}%;background:${{col}}"></div>
+        </div>
+        <span class="an-diverg-pct">${{yf.toFixed(0)}}%</span>
+      </div>
+      <div class="an-diverg-bar-col">
+        <div class="an-diverg-bar-wrap">
+          <div class="an-diverg-bar-fill" style="width:${{mf.toFixed(0)}}%;background:${{col}};opacity:.75"></div>
+        </div>
+        <span class="an-diverg-pct">${{mf.toFixed(0)}}%</span>
+      </div>
       <div class="an-diverg-delta" style="color:${{deltaCol}}">${{deltaStr}}</div>
     </div>`;
   }}).join('');
@@ -1805,15 +1826,20 @@ function anRenderRoot() {{
         <div class="an-panel-eyebrow">ROLE DNA — COMPOSITION DIVERGENCE</div>
         <div class="an-panel-title">WHY</div>
         <span class="an-panel-subtitle">なぜ</span>
-        ${{calloutHtml}}
-        <div class="an-diverg">
-          <div class="an-diverg-header">
-            <span style="text-align:right">YOUR / あなた</span>
-            <span style="text-align:center">← LEFT</span>
-            <span style="text-align:center">RIGHT →</span>
-            <span>META / 敵</span>
+        <div class="an-why-body">
+          <div class="an-callout">
+            <div class="an-callout-title">THE BIG SWING · 差の核心</div>
+            ${{calloutHtml || '<span style="color:var(--dim);font-size:12px">No significant divergence.</span>'}}
           </div>
-          ${{divergRowsHtml}}
+          <div class="an-diverg">
+            <div class="an-diverg-header">
+              <span></span>
+              <span>YOUR / あなた</span>
+              <span>META / 敵</span>
+              <span style="text-align:right">Δ</span>
+            </div>
+            ${{divergRowsHtml}}
+          </div>
         </div>
       </div>
     </div>
