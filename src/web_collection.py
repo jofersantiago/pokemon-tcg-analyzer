@@ -91,39 +91,46 @@ def _prepare_page_data(
             })
 
     # ── META tab ─────────────────────────────────────────────────────────────
-    def _hero_img(arch: dict) -> str:
-        """Return CDN image URL for the representative Pokémon of an archetype.
+    def _hero_imgs(arch: dict) -> list[str]:
+        """Return up to 2 CDN image URLs for the representative Pokémon of an archetype.
 
         Priority:
-        1. Pokémon whose name appears in the archetype name (e.g. 'Charizard ex'
-           is in 'Charizard ex / Moltres ex').
-        2. Pokémon with the highest HP (typically the win-condition attacker).
-        3. Any first Pokémon card.
-        4. Any first card at all.
+        1. Pokémon whose names appear in the archetype name (e.g. 'Charizard ex'
+           and 'Moltres ex' in 'Charizard ex / Moltres ex').
+        2. Top-2 Pokémon by HP as fallback.
         """
         arch_name_lower = arch.get("name", "").lower()
-        best_id: str = ""
-        best_hp: int = -1
+        named: list[str] = []
+        by_hp: list[tuple[int, str]] = []
 
         for entry in arch.get("cards", []):
             card = catalog.get(entry["id"])
             if not card or not card.is_pokemon:
                 continue
-            # Exact name match inside the archetype label → use immediately
             if card.name.lower() in arch_name_lower:
-                return _card_image_url(entry["id"])
-            # Track the highest-HP Pokémon as fallback
-            if (card.hp or 0) > best_hp:
-                best_hp = card.hp or 0
-                best_id = entry["id"]
+                url = _card_image_url(entry["id"])
+                if url not in named:
+                    named.append(url)
+            else:
+                by_hp.append((card.hp or 0, _card_image_url(entry["id"])))
 
-        if best_id:
-            return _card_image_url(best_id)
+        # Fill up to 2 from named matches first, then highest-HP fallbacks
+        result = named[:2]
+        if len(result) < 2:
+            by_hp.sort(reverse=True)
+            for _, url in by_hp:
+                if url not in result:
+                    result.append(url)
+                if len(result) == 2:
+                    break
 
         # Last resort: first card of any type
-        for entry in arch.get("cards", []):
-            return _card_image_url(entry["id"])
-        return ""
+        if not result:
+            for entry in arch.get("cards", []):
+                result.append(_card_image_url(entry["id"]))
+                break
+
+        return result
 
     meta_data = sorted(
         [
@@ -133,7 +140,8 @@ def _prepare_page_data(
                 "meta_share": round(arch.get("meta_share", 0) * 100, 1),
                 "win_rate": round(arch.get("win_rate", 0.5) * 100, 1),
                 "ewr": round(ewr * 100, 1),
-                "hero_img": _hero_img(arch),
+                "hero_img": (_hero_imgs(arch) + [""])[0],
+                "hero_imgs": _hero_imgs(arch),
             }
             for arch, ewr in zip(archetypes, ewrs)
         ],
@@ -381,10 +389,13 @@ def _build_html(page_data: dict, my_cards: dict) -> str:  # noqa: E501
   .arch-img-area {{
     height: 220px; background: var(--panel); border-bottom: 4px solid var(--border);
     display: flex; align-items: center; justify-content: center;
-    position: relative; overflow: hidden;
+    position: relative; overflow: hidden; gap: 4px;
   }}
   .arch-img-area img {{
-    height: 100%; width: 100%; object-fit: contain; display: block;
+    height: 100%; width: 50%; object-fit: contain; display: block; flex-shrink: 0;
+  }}
+  .arch-img-area.single img {{
+    width: 100%;
   }}
   .arch-sticker {{
     position: absolute; top: 10px; left: 10px;
@@ -671,8 +682,8 @@ def _build_html(page_data: dict, my_cards: dict) -> str:  # noqa: E501
 
   /* Workspace */
   .an-workspace {{
-    display: grid; grid-template-columns: 1.2fr 1fr;
-    gap: 24px; padding: 40px 32px 0; align-items: start;
+    display: flex; flex-direction: column;
+    gap: 24px; padding: 40px 32px 0;
   }}
   .an-panel {{
     background: var(--card-bg); border: 4px solid var(--border);
@@ -1284,14 +1295,15 @@ function renderMeta() {{
   grid.innerHTML = '';
   META_DATA.forEach((arch, i) => {{
     const ewrCls  = arch.ewr >= 52 ? 'wr-hi' : arch.ewr < 48 ? 'wr-lo' : '';
-    const imgHtml = arch.hero_img
-      ? `<img src="${{arch.hero_img}}" alt="${{arch.name}}"
-              onerror="this.style.display='none'">`
+    const imgs = arch.hero_imgs && arch.hero_imgs.length ? arch.hero_imgs : (arch.hero_img ? [arch.hero_img] : []);
+    const imgHtml = imgs.length
+      ? imgs.map(u => `<img src="${{u}}" alt="${{arch.name}}" onerror="this.style.display='none'">`).join('')
       : `<span style="font-size:56px">🃏</span>`;
+    const areaCls = imgs.length === 1 ? 'arch-img-area single' : 'arch-img-area';
     const div = document.createElement('div');
     div.className = 'arch-card';
     div.innerHTML = `
-      <div class="arch-img-area">
+      <div class="${{areaCls}}">
         <div class="arch-sticker">#${{i + 1}}</div>
         ${{imgHtml}}
       </div>
@@ -1810,19 +1822,6 @@ function anRenderRoot() {{
 
     <div class="an-workspace">
       <div class="an-panel">
-        <div class="an-panel-eyebrow">HOW TO WIN THIS MATCHUP</div>
-        <div class="an-panel-title">CLOSE THE GAP</div>
-        <span class="an-panel-subtitle">差を埋めよ</span>
-        ${{roleRowsHtml}}
-        <div class="an-card-list-header">
-          <div class="an-card-list-title">CARDS TO ACQUIRE ${{allMissing.length ? '(' + allMissing.length + ')' : ''}}</div>
-          ${{filterBadge}}
-          ${{anRoleFilter ? `<button class="an-clear-btn" onclick="anToggleRole(null)">✕ CLEAR</button>` : ''}}
-        </div>
-        ${{cardListHtml}}
-      </div>
-
-      <div class="an-panel">
         <div class="an-panel-eyebrow">ROLE DNA — COMPOSITION DIVERGENCE</div>
         <div class="an-panel-title">WHY</div>
         <span class="an-panel-subtitle">なぜ</span>
@@ -1841,6 +1840,19 @@ function anRenderRoot() {{
             ${{divergRowsHtml}}
           </div>
         </div>
+      </div>
+
+      <div class="an-panel">
+        <div class="an-panel-eyebrow">HOW TO WIN THIS MATCHUP</div>
+        <div class="an-panel-title">CLOSE THE GAP</div>
+        <span class="an-panel-subtitle">差を埋めよ</span>
+        ${{roleRowsHtml}}
+        <div class="an-card-list-header">
+          <div class="an-card-list-title">CARDS TO ACQUIRE ${{allMissing.length ? '(' + allMissing.length + ')' : ''}}</div>
+          ${{filterBadge}}
+          ${{anRoleFilter ? `<button class="an-clear-btn" onclick="anToggleRole(null)">✕ CLEAR</button>` : ''}}
+        </div>
+        ${{cardListHtml}}
       </div>
     </div>
 
