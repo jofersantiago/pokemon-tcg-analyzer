@@ -95,27 +95,45 @@ def _prepare_page_data(
         """Return up to 2 CDN image URLs for the representative Pokémon of an archetype.
 
         Priority:
-        1. Pokémon whose names appear in the archetype name (e.g. 'Charizard ex'
-           and 'Moltres ex' in 'Charizard ex / Moltres ex').
+        1. Pokémon whose base name (stripped of 'ex'/'v'/'vmax' suffix) appears
+           in the archetype name — ordered by how early they appear in the name.
         2. Top-2 Pokémon by HP as fallback.
         """
+        import re as _re
         arch_name_lower = arch.get("name", "").lower()
-        named: list[str] = []
+
+        def _base(name: str) -> str:
+            """Strip common card-suffix words so 'Altaria ex' → 'altaria'."""
+            return _re.sub(r'\s+(ex|v|vmax|vstar|gx)\s*$', '', name.lower()).strip()
+
+        def _name_score(card_name: str) -> int:
+            """Lower = better match. -1 means no match."""
+            base = _base(card_name)
+            full = card_name.lower()
+            pos = arch_name_lower.find(base)
+            if pos == -1:
+                pos = arch_name_lower.find(full)
+            return pos  # -1 if not found, else index (earlier = higher priority)
+
+        named: list[tuple[int, int, str]] = []   # (position, hp, url)
         by_hp: list[tuple[int, str]] = []
 
         for entry in arch.get("cards", []):
             card = catalog.get(entry["id"])
             if not card or not card.is_pokemon:
                 continue
-            if card.name.lower() in arch_name_lower:
-                url = _card_image_url(entry["id"])
-                if url not in named:
-                    named.append(url)
+            url = _card_image_url(entry["id"])
+            score = _name_score(card.name)
+            if score >= 0:
+                named.append((score, -(card.hp or 0), url))
             else:
-                by_hp.append((card.hp or 0, _card_image_url(entry["id"])))
+                by_hp.append((card.hp or 0, url))
 
-        # Fill up to 2 from named matches first, then highest-HP fallbacks
-        result = named[:2]
+        # Sort named by position in deck name (earliest first)
+        named.sort(key=lambda x: (x[0], x[1]))
+        result = list(dict.fromkeys(u for _, _, u in named))[:2]
+
+        # Fill remaining slots with highest-HP Pokémon
         if len(result) < 2:
             by_hp.sort(reverse=True)
             for _, url in by_hp:
@@ -562,7 +580,7 @@ def _build_html(page_data: dict, my_cards: dict) -> str:  # noqa: E501
     border: 2px solid var(--border); box-shadow: 2px 2px 0 0 #0A0A0A;
     overflow: hidden; background: var(--panel); position: relative;
   }}
-  .an-sc-hand-card img {{ width: 100%; height: 100%; object-fit: cover; object-position: center top; display: block; }}
+  .an-sc-hand-card img {{ width: 100%; height: 100%; object-fit: contain; display: block; }}
   .an-sc-hand-card.hc-left  {{ z-index: 1; }}
   .an-sc-hand-card.hc-mid   {{ z-index: 3; }}
   .an-sc-hand-card.hc-right {{ z-index: 1; }}
@@ -1460,13 +1478,21 @@ function anVerdictInfo(wr) {{
 }}
 
 function anTop3Cards(deck) {{
-  // Return up to 3 unique Pokémon cards, sorted by role priority (win_condition first)
+  // Return up to 3 unique Pokémon cards.
+  // Priority: 1) name appears in deck name, 2) role priority (win_condition first)
+  const deckNameLower = (deck.name || deck.id || '').toLowerCase();
   const seen = {{}};
   const unique = [];
   for (const c of (deck.cards || [])) {{
     if (!seen[c.id] && c.type === 'Pokemon') {{ seen[c.id] = true; unique.push(c); }}
   }}
-  unique.sort((a, b) => (ROLE_ORDER[a.role] ?? 4) - (ROLE_ORDER[b.role] ?? 4));
+  // Score: named match = 0, then by role order
+  unique.sort((a, b) => {{
+    const aName = deckNameLower && a.name && deckNameLower.includes(a.name.toLowerCase().replace(/ ex$/i,'').replace(/ v$/i,'').trim()) ? 0 : 1;
+    const bName = deckNameLower && b.name && deckNameLower.includes(b.name.toLowerCase().replace(/ ex$/i,'').replace(/ v$/i,'').trim()) ? 0 : 1;
+    if (aName !== bName) return aName - bName;
+    return (ROLE_ORDER[a.role] ?? 4) - (ROLE_ORDER[b.role] ?? 4);
+  }});
   return unique.slice(0, 3);
 }}
 
