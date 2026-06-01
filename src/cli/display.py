@@ -29,7 +29,7 @@ def pick(options: list[str], label: str = "Choose") -> int:
     """
     for i, opt in enumerate(options, 1):
         print(f"  [{i}] {opt}")
-    print(f"  [0] Back")
+    print("  [0] Back")
     while True:
         raw = input(f"\n{label}: ").strip()
         if raw == "0":

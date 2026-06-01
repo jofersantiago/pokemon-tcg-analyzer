@@ -1,11 +1,8 @@
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
-from tabulate import tabulate
-
-from src.models import Card, Deck, Collection
+from src.models import Card, Collection
 from src.card_roles import ROLES, deck_role_fractions, attribute_win_rate
 from src.cli.state import AppState
 from src.cli import collection_io
@@ -14,6 +11,7 @@ from src.cli.display import header, table, separator, pick, prompt
 _COLLECTION_PATH = Path(__file__).parent.parent.parent / "my_collection.json"
 
 # ── helpers ──────────────────────────────────────────────────────────────────
+
 
 def _pct(value: float) -> str:
     return f"{value * 100:.1f}%"
@@ -169,14 +167,14 @@ def _collection_import(state: AppState) -> None:
     count, warnings = collection_io.import_csv(state.catalog)
     for w in warnings:
         if w == "template_created":
-            print(f"\nNo collection file found. A template has been created at:")
+            print("\nNo collection file found. A template has been created at:")
             print(f"  {collection_io.CSV_PATH}")
-            print(f"\nFormat:")
-            print(f"  card_id,count")
-            print(f"  A1-001,2")
-            print(f"\nFind card IDs at:")
-            print(f"  https://github.com/flibustier/pokemon-tcg-pocket-database")
-            print(f"\nEdit the file, then run import again.")
+            print("\nFormat:")
+            print("  card_id,count")
+            print("  A1-001,2")
+            print("\nFind card IDs at:")
+            print("  https://github.com/flibustier/pokemon-tcg-pocket-database")
+            print("\nEdit the file, then run import again.")
         else:
             print(w)
     if count > 0:
@@ -196,7 +194,7 @@ def _collection_random(state: AppState) -> None:
     if existing:
         confirm = input(
             f"You have {sum(existing.values())} cards already. "
-            f"Overwrite? [y/N]: "
+            "Overwrite? [y/N]: "
         ).strip().lower()
         if confirm != "y":
             print("Cancelled.")
@@ -214,7 +212,7 @@ def _collection_random(state: AppState) -> None:
     unique = len(result)
     total = sum(result.values())
     print(f"\nAdded {total} cards across {unique} unique cards to your collection.")
-    print(f"Collection saved to my_collection.json.\n")
+    print("Collection saved to my_collection.json.\n")
 
     print("Sample of what you got:")
     sample = sorted(result.items(), key=lambda x: -x[1])[:8]
@@ -357,7 +355,7 @@ def cmd_analysis(state: AppState, your_name: str = "") -> None:
     print(f"OPP DECK:  {state.archetypes[opp_idx]['name']}")
     separator()
 
-    print(f"\nWIN RATE / 勝率")
+    print("\nWIN RATE / 勝率")
     print(f"  {data['ewr'] * 100:.1f}%   "
           f"(R² = {state.regression.r_squared:.3f} · MODEL FIT)\n")
 
