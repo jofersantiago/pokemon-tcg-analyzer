@@ -21,13 +21,13 @@ _CSV_TEMPLATE = (
 def load_collection() -> dict[str, int]:
     if not COLLECTION_PATH.exists():
         return {}
-    with open(COLLECTION_PATH) as f:
+    with open(COLLECTION_PATH, encoding="utf-8") as f:
         return json.load(f)
 
 
 def save_collection(cards: dict[str, int]) -> None:
     COLLECTION_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with open(COLLECTION_PATH, "w") as f:
+    with open(COLLECTION_PATH, "w", encoding="utf-8") as f:
         json.dump(cards, f, indent=2)
 
 
@@ -62,6 +62,9 @@ def import_csv(catalog: dict[str, Card]) -> tuple[int, list[str]]:
                 count = int(count_str)
             except ValueError:
                 warnings.append(f"WARNING: invalid count '{count_str}' for {card_id} — skipped")
+                continue
+            if count <= 0:
+                warnings.append(f"WARNING: count for {card_id} is {count} — skipped")
                 continue
             collection[card_id] = collection.get(card_id, 0) + count
             imported += 1
