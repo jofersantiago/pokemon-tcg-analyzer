@@ -213,3 +213,9 @@ python main.py
 
 - **Card Catalog** — [flibustier/pokemon-tcg-pocket-database](https://github.com/flibustier/pokemon-tcg-pocket-database) on GitHub
 - **Tournament Data** — [Limitless TCG API](https://docs.limitlesstcg.com/developer.html)
+
+---
+
+## Inspiration
+
+- **[Shoppu by Mochi](https://shoppu.mochi.at/)** — UI design and aesthetic inspiration
