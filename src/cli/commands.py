@@ -160,7 +160,7 @@ def cmd_collection(state: AppState) -> None:
         elif choice == 2:
             _collection_manual(state)
         elif choice == 3:
-            _collection_view()
+            _collection_view(state)
 
 
 def _collection_import(state: AppState) -> None:
@@ -253,7 +253,7 @@ def _collection_manual(state: AppState) -> None:
         print(f"  Saved. {card.name}: {int(new_count_str)} copies.")
 
 
-def _collection_view() -> None:
+def _collection_view(state: AppState) -> None:
     header("YOUR COLLECTION")
     col = collection_io.load_collection()
     if not col:
@@ -262,7 +262,11 @@ def _collection_view() -> None:
         input("\nPress Enter to continue...")
         return
     rows = sorted(col.items(), key=lambda x: x[0])
-    table([[cid, cnt] for cid, cnt in rows], headers=["Card ID", "Count"])
+    display_rows = [
+        [cid, state.catalog[cid].name if cid in state.catalog else "—", cnt]
+        for cid, cnt in rows
+    ]
+    table(display_rows, headers=["Card ID", "Name", "Count"])
     print(f"\nTotal: {sum(col.values())} cards across {len(col)} unique cards.")
     input("\nPress Enter to continue...")
 

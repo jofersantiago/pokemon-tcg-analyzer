@@ -122,7 +122,7 @@ def main() -> None:
         elif sub == "random":
             commands._collection_random(state)
         elif sub == "view":
-            commands._collection_view()
+            commands._collection_view(state)
         else:
             commands.cmd_collection(state)
     elif args.command == "catalog":
