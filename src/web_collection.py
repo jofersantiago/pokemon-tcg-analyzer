@@ -1988,6 +1988,7 @@ function ndSearch() {{
         <div class="nd-result-sub">${{c.type.toUpperCase()}} · ${{c.set}}</div>
       </div>
     <button class="nd-add-btn" onclick="ndAddCard('${{c.id}}','${{c.name.replace(/'/g,"\\\\'")}}','${{c.type}}','${{c.img || ''}}')">ADD</button>`;
+    el.appendChild(div);
   }});
 }}
 
