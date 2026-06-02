@@ -1,0 +1,12 @@
+data/cache/
+outputs/
+__pycache__/
+*.pyc
+.env
+venv/
+.pytest_cache/
+.DS_Store
+my_collection.json
+my_decks.json
+sample.html
+*.zip

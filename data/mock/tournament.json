@@ -1,0 +1,102 @@
+{
+  "archetypes": [
+    {
+      "id": "charizard-ex",
+      "name": "Charizard ex",
+      "meta_share": 0.22,
+      "win_rate": 0.58,
+      "cards": [
+        {"id": "A1-036", "name": "Charizard ex", "count": 2},
+        {"id": "A1-034", "name": "Charmeleon", "count": 2},
+        {"id": "A1-033", "name": "Charmander", "count": 2},
+        {"id": "A1-047", "name": "Moltres ex", "count": 2},
+        {"id": "PROMO-A-005", "name": "Poke Ball", "count": 2},
+        {"id": "PROMO-A-007", "name": "Professor's Research", "count": 2},
+        {"id": "PROMO-A-001", "name": "Potion", "count": 2},
+        {"id": "PROMO-A-002", "name": "X Speed", "count": 2},
+        {"id": "A1-221", "name": "Blaine", "count": 2},
+        {"id": "A1-223", "name": "Giovanni", "count": 2}
+      ]
+    },
+    {
+      "id": "pikachu-ex",
+      "name": "Pikachu ex / Raichu",
+      "meta_share": 0.18,
+      "win_rate": 0.55,
+      "cards": [
+        {"id": "A1-096", "name": "Pikachu ex", "count": 2},
+        {"id": "A1-095", "name": "Raichu", "count": 2},
+        {"id": "A1-094", "name": "Pikachu", "count": 2},
+        {"id": "A1-104", "name": "Zapdos ex", "count": 1},
+        {"id": "A1-103", "name": "Zapdos", "count": 1},
+        {"id": "PROMO-A-005", "name": "Poke Ball", "count": 2},
+        {"id": "PROMO-A-007", "name": "Professor's Research", "count": 2},
+        {"id": "PROMO-A-002", "name": "X Speed", "count": 2},
+        {"id": "A1-226", "name": "Lt. Surge", "count": 2},
+        {"id": "PROMO-A-001", "name": "Potion", "count": 2},
+        {"id": "A1-225", "name": "Sabrina", "count": 2}
+      ]
+    },
+    {
+      "id": "mewtwo-ex",
+      "name": "Mewtwo ex / Gardevoir",
+      "meta_share": 0.25,
+      "win_rate": 0.52,
+      "cards": [
+        {"id": "A1-129", "name": "Mewtwo ex", "count": 2},
+        {"id": "A1-132", "name": "Gardevoir", "count": 2},
+        {"id": "A1-131", "name": "Kirlia", "count": 2},
+        {"id": "A1-130", "name": "Ralts", "count": 2},
+        {"id": "A1-128", "name": "Mewtwo", "count": 2},
+        {"id": "PROMO-A-005", "name": "Poke Ball", "count": 2},
+        {"id": "PROMO-A-007", "name": "Professor's Research", "count": 2},
+        {"id": "A1-225", "name": "Sabrina", "count": 2},
+        {"id": "A1-222", "name": "Koga", "count": 2},
+        {"id": "PROMO-A-001", "name": "Potion", "count": 2}
+      ]
+    },
+    {
+      "id": "gyarados-ex",
+      "name": "Gyarados ex",
+      "meta_share": 0.15,
+      "win_rate": 0.47,
+      "cards": [
+        {"id": "A1a-018", "name": "Gyarados ex", "count": 2},
+        {"id": "A1a-017", "name": "Magikarp", "count": 2},
+        {"id": "A1-077", "name": "Magikarp", "count": 2},
+        {"id": "A1-220", "name": "Misty", "count": 2},
+        {"id": "PROMO-A-005", "name": "Poke Ball", "count": 2},
+        {"id": "PROMO-A-007", "name": "Professor's Research", "count": 2},
+        {"id": "PROMO-A-001", "name": "Potion", "count": 2},
+        {"id": "PROMO-A-002", "name": "X Speed", "count": 2},
+        {"id": "A1-224", "name": "Brock", "count": 2},
+        {"id": "A1-225", "name": "Sabrina", "count": 2}
+      ]
+    },
+    {
+      "id": "starmie-ex",
+      "name": "Starmie ex / Misty",
+      "meta_share": 0.20,
+      "win_rate": 0.51,
+      "cards": [
+        {"id": "A1-076", "name": "Starmie ex", "count": 2},
+        {"id": "A1-074", "name": "Staryu", "count": 2},
+        {"id": "A1-075", "name": "Starmie", "count": 2},
+        {"id": "A1-220", "name": "Misty", "count": 2},
+        {"id": "PROMO-A-005", "name": "Poke Ball", "count": 2},
+        {"id": "PROMO-A-007", "name": "Professor's Research", "count": 2},
+        {"id": "PROMO-A-002", "name": "X Speed", "count": 2},
+        {"id": "PROMO-A-001", "name": "Potion", "count": 2},
+        {"id": "A1-225", "name": "Sabrina", "count": 2},
+        {"id": "A1-224", "name": "Brock", "count": 2}
+      ]
+    }
+  ],
+  "matchup_matrix": {
+    "charizard-ex": {"charizard-ex": 0.50, "pikachu-ex": 0.42, "mewtwo-ex": 0.55, "gyarados-ex": 0.61, "starmie-ex": 0.53},
+    "pikachu-ex":   {"charizard-ex": 0.58, "pikachu-ex": 0.50, "mewtwo-ex": 0.48, "gyarados-ex": 0.55, "starmie-ex": 0.60},
+    "mewtwo-ex":    {"charizard-ex": 0.45, "pikachu-ex": 0.52, "mewtwo-ex": 0.50, "gyarados-ex": 0.54, "starmie-ex": 0.50},
+    "gyarados-ex":  {"charizard-ex": 0.39, "pikachu-ex": 0.45, "mewtwo-ex": 0.46, "gyarados-ex": 0.50, "starmie-ex": 0.43},
+    "starmie-ex":   {"charizard-ex": 0.47, "pikachu-ex": 0.40, "mewtwo-ex": 0.50, "gyarados-ex": 0.57, "starmie-ex": 0.50}
+  }
+}
