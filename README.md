@@ -12,24 +12,32 @@ A data-driven tool that helps Pokémon TCG Pocket players understand the competi
 - **Classifies cards by role** (win condition, engine, staple, tech, garnet) and runs a regression to show which roles drive win rates
 - **Generates charts**: matchup heatmap, observed vs. predicted win rates, role contribution breakdown
 - **Launches a browser UI** where you can manage your collection, build custom decks, explore archetypes, and get deck vs. deck analysis
+- **Runs as a terminal CLI** — full feature parity with the browser UI, no browser required
 
 ---
 
 ## Quickstart
 
-### Mac / Linux
+### Browser UI (Mac / Linux)
 ```bash
 bash setup.sh
 python3 main.py
 ```
 
-### Windows
+### Browser UI (Windows)
 ```bat
 setup.bat
 python main.py
 ```
 
-The setup script creates a virtual environment and installs all dependencies. On first run, `main.py` downloads and caches the card catalog and tournament data automatically — no manual setup needed.
+### CLI (terminal-only, no browser needed)
+```bash
+python3 main_cli.py          # interactive menu
+python3 main_cli.py meta     # browse top archetypes directly
+python3 main_cli.py analysis # deck vs. deck analysis
+```
+
+The setup script creates a virtual environment and installs all dependencies. On first run, both `main.py` and `main_cli.py` download and cache the card catalog and tournament data automatically — no manual setup needed.
 
 ---
 
@@ -58,22 +66,32 @@ Python dependencies (auto-installed by setup scripts):
 ```
 .
 ├── main.py                 # Entry point — runs pipeline then launches browser UI
+├── main_cli.py             # Entry point — terminal CLI (no browser needed)
 ├── src/
 │   ├── data_ingest.py      # Fetch & cache card catalog + tournament data
 │   ├── models.py           # Card, Deck, Collection dataclasses
 │   ├── matchup.py          # Archetype fingerprinting + expected win rate
 │   ├── card_roles.py       # Role classification + win rate regression
 │   ├── visualizations.py   # Matplotlib charts + terminal table
-│   └── web_collection.py   # Browser UI (HTTP server + full HTML/CSS/JS)
+│   ├── web_collection.py   # Browser UI (HTTP server + full HTML/CSS/JS)
+│   └── cli/
+│       ├── state.py        # AppState dataclass shared across CLI commands
+│       ├── display.py      # Terminal output helpers (tables, menus, prompts)
+│       ├── collection_io.py# CSV import, random generator, fuzzy card search
+│       ├── commands.py     # Meta, Collection, Catalog, Analysis commands
+│       └── menu.py         # Interactive numbered menu loop
 ├── tests/
 │   ├── conftest.py         # Shared fixtures
 │   ├── test_models.py
 │   ├── test_matchup.py
 │   ├── test_card_roles.py
 │   ├── test_data_ingest.py
-│   └── test_visualizations.py
+│   ├── test_visualizations.py
+│   ├── test_cli_collection_io.py
+│   └── test_cli_commands.py
 ├── data/cache/             # Auto-generated — cached API responses (gitignored)
 ├── outputs/                # Auto-generated — PNG charts (gitignored)
+├── my_collection.json      # Your card collection — shared by both UI and CLI
 ├── requirements.txt
 ├── setup.sh                # Mac/Linux setup
 └── setup.bat               # Windows setup
@@ -151,6 +169,75 @@ Your collection and custom decks are saved locally as `my_collection.json` and `
 
 ---
 
+## CLI — Terminal Mode
+
+The CLI mirrors the 4 main tabs of the browser UI and runs entirely in the terminal — no browser, no HTTP server.
+
+### Interactive menu (recommended for first use)
+```bash
+python3 main_cli.py
+```
+Launches a numbered menu with all 4 tabs. Use arrow keys or type a number to navigate.
+
+### Direct subcommands
+```bash
+# Browse top archetypes
+python3 main_cli.py meta
+
+# Manage your collection
+python3 main_cli.py collection            # sub-menu
+python3 main_cli.py collection import     # import from CSV
+python3 main_cli.py collection random     # generate a random collection
+python3 main_cli.py collection view       # view your current collection
+
+# Search the card catalog
+python3 main_cli.py catalog
+python3 main_cli.py catalog --search "Espeon"
+
+# Deck vs. deck analysis
+python3 main_cli.py analysis
+python3 main_cli.py analysis --deck "Mega Altaria"
+```
+
+### CLI tabs
+
+| Tab | What You Can Do |
+|---|---|
+| **Meta** | Browse all top archetypes ranked by meta share and win rate; drill into any deck's full card list |
+| **Collection** | Import from CSV, generate a random collection (small / medium / large), add cards manually, or view your collection |
+| **Catalog** | Search all ~3,200 cards by name, type, or set; view full card details including attacks and abilities |
+| **Analysis** | Pick your deck and an opponent — see Role DNA divergence, win rate attribution, and exactly which cards to acquire |
+
+### Building your collection in the CLI
+
+**Option 1 — Import from a CSV file:**
+
+Create `data/my_collection.csv` with this format:
+```csv
+card_id,count
+A1-001,2
+A1-036,1
+A2b-037,2
+```
+Find card IDs at [github.com/flibustier/pokemon-tcg-pocket-database](https://github.com/flibustier/pokemon-tcg-pocket-database).
+Then run: `python3 main_cli.py collection import`
+
+**Option 2 — Generate a random collection (great for testing):**
+```bash
+python3 main_cli.py collection random
+# Choose: Small (~60 cards), Medium (~150), or Large (~300)
+```
+
+**Option 3 — Add cards one by one:**
+```bash
+python3 main_cli.py collection
+# → Add / remove cards manually → fuzzy name search
+```
+
+The CLI and browser UI share the same `my_collection.json` — changes made in one are immediately visible in the other.
+
+---
+
 ## Running Tests
 
 ```bash
@@ -172,7 +259,7 @@ venv/bin/pytest tests/test_matchup.py::test_known_deck_ewr -v
 ## Lint
 
 ```bash
-flake8 src/ tests/ main.py --max-line-length=100
+flake8 src/ tests/ main.py main_cli.py --max-line-length=100
 ```
 
 ---
@@ -200,11 +287,15 @@ zip -r submission.zip . \
 
 To restore on a new machine:
 ```bash
-bash setup.sh      # Mac/Linux
-python3 main.py
+# Mac / Linux
+bash setup.sh
+python3 main.py       # browser UI
+python3 main_cli.py   # terminal CLI
 
-setup.bat          # Windows
+# Windows
+setup.bat
 python main.py
+python main_cli.py
 ```
 
 ---
