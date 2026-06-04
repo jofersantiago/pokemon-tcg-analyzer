@@ -7,6 +7,11 @@ def test_card_from_dict_basic():
     assert card.id == "A1-001" and card.hp == 70 and card.card_type == "Pokemon"
 
 
+def test_card_from_dict_missing_type_defaults_to_pokemon():
+    card = Card.from_dict({"id": "A1-002", "name": "Ivysaur"})
+    assert card.card_type == "Pokemon"
+
+
 def test_card_max_damage():
     card = Card.from_dict({
         "id": "A1-001", "name": "Bulbasaur", "type": "Pokemon", "hp": 70,

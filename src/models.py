@@ -29,8 +29,10 @@ class Card:
 
     @classmethod
     def from_dict(cls, data: dict) -> Card:
-        raw_type = data.get("type", "")
+        raw_type = data.get("type") or ""
         card_type = _TYPE_MAP.get(raw_type.lower(), raw_type)
+        if not card_type:
+            card_type = "Pokemon"
         return cls(
             id=data["id"],
             name=data["name"],
@@ -74,6 +76,7 @@ class Card:
 class Deck:
     cards: list[Card]
     archetype_label: str = ""
+    archetype_id: str = ""
 
     def __post_init__(self) -> None:
         if len(self.cards) > 20:
@@ -102,11 +105,16 @@ class Deck:
             if card is None:
                 continue  # skip cards from sets not yet in the catalog
             cards.extend([card] * entry["count"])
-        return cls(cards=cards, archetype_label=data.get("archetype", data.get("id", "")))
+        return cls(
+            cards=cards,
+            archetype_label=data.get("archetype", data.get("id", "")),
+            archetype_id=str(data.get("id") or ""),
+        )
 
     def to_dict(self) -> dict:
         return {
             "archetype": self.archetype_label,
+            "id": self.archetype_id,
             "cards": [{"id": cid, "count": n} for cid, n in self.card_counts().items()],
         }
 
@@ -132,6 +140,48 @@ class Collection:
             if shortfall > 0:
                 result.append((card_map[cid], shortfall))
         return sorted(result, key=lambda x: x[0].name)
+
+    def _base_name(self, name: str) -> str:
+        import re
+        if not name:
+            return ""
+        b = re.sub(r"\s+(ex|v|vmax|vstar|gx)\s*$", "", name, flags=re.IGNORECASE)
+        return b.strip().title()
+
+    def completion_percent_by_name(self, deck: Deck) -> float:
+        needed = deck.card_counts()
+        card_map = {c.id: c for c in deck.unique_cards()}
+        name_needed: dict[str, int] = {}
+        name_have: dict[str, int] = {}
+        for cid, count in needed.items():
+            name = self._base_name(card_map[cid].name)
+            if not name:
+                name = card_map[cid].id
+            name_needed[name] = name_needed.get(name, 0) + count
+            name_have[name] = name_have.get(name, 0) + min(self.cards.get(cid, 0), count)
+        total_needed = sum(name_needed.values())
+        if total_needed == 0:
+            return 100.0
+        have = sum(min(name_have[n], name_needed[n]) for n in name_needed)
+        return round(100.0 * have / total_needed, 1)
+
+    def missing_cards_by_name(self, deck: Deck) -> list[tuple[str, int]]:
+        needed = deck.card_counts()
+        card_map = {c.id: c for c in deck.unique_cards()}
+        name_needed: dict[str, int] = {}
+        name_have: dict[str, int] = {}
+        for cid, count in needed.items():
+            name = self._base_name(card_map[cid].name)
+            if not name:
+                name = card_map[cid].id
+            name_needed[name] = name_needed.get(name, 0) + count
+            name_have[name] = name_have.get(name, 0) + min(self.cards.get(cid, 0), count)
+        result: list[tuple[str, int]] = []
+        for name, need in name_needed.items():
+            short = need - name_have.get(name, 0)
+            if short > 0:
+                result.append((name, short))
+        return sorted(result, key=lambda x: x[0])
 
     @classmethod
     def from_dict(cls, data: dict) -> Collection:

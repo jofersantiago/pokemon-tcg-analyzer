@@ -37,14 +37,46 @@ def _prepare_page_data(
     regression=None,
 ) -> dict:
     """Prepare all JSON-serialisable data the browser tabs need."""
+    def _fallback_card(card_id: str, name: str | None = None) -> Card:
+        return Card(id=card_id, name=name or card_id, card_type="Pokemon")
+
+    def _normalize(text: str) -> str:
+        return __import__("re").sub(r'[^a-z0-9]+', ' ', (text or '').lower()).strip()
+
+    def _guess_missing_card_names(arch_name: str, known_names: list[str]) -> list[str]:
+        arch_norm = _normalize(arch_name)
+        remaining = arch_norm
+        for name in known_names:
+            if not name:
+                continue
+            name_norm = _normalize(name)
+            if name_norm and name_norm in remaining:
+                remaining = remaining.replace(name_norm, ' ')
+            stripped = _normalize(__import__("re").sub(r'\s+(ex|v|vmax|vstar|gx)\s*$', '', name.lower()))
+            if stripped and stripped in remaining:
+                remaining = remaining.replace(stripped, ' ')
+        remaining = _normalize(remaining)
+        if not remaining:
+            return []
+        tokens = [t for t in remaining.split() if t not in {"and", "vs", "the", "a", "an", "of"}]
+        if len(tokens) == 1:
+            return [tokens[0].title()]
+        if len(tokens) == 2 and (tokens[0] == "ex" or tokens[1] == "ex"):
+            return [" ".join(tokens).title()]
+        return []
+
     # ── COLLECTION tab ──────────────────────────────────────────────────────
     decks_data = []
     for arch in archetypes:
+        known_names = [catalog[entry["id"]].name for entry in arch.get("cards", []) if entry["id"] in catalog]
+        missing_names = _guess_missing_card_names(arch.get("name", ""), known_names)
+        missing_iter = iter(missing_names)
         cards_data = []
         for entry in arch.get("cards", []):
             card = catalog.get(entry["id"])
             if card is None:
-                continue
+                fallback_name = next(missing_iter, entry["id"])
+                card = _fallback_card(entry["id"], fallback_name)
             cards_data.append({
                 "id": entry["id"],
                 "name": card.name,
@@ -68,9 +100,7 @@ def _prepare_page_data(
     for cdeck in (custom_decks or []):
         cards_data = []
         for entry in cdeck.get("cards", []):
-            card = catalog.get(entry["id"])
-            if card is None:
-                continue
+            card = catalog.get(entry["id"]) or _fallback_card(entry["id"])
             cards_data.append({
                 "id": entry["id"],
                 "name": card.name,
@@ -100,29 +130,49 @@ def _prepare_page_data(
         2. Top-2 Pokémon by HP as fallback.
         """
         import re as _re
-        arch_name_lower = arch.get("name", "").lower()
+        arch_name_lower = _re.sub(r'[^a-z0-9]+', ' ', arch.get("name", "").lower()).strip()
 
         def _base(name: str) -> str:
             """Strip common card-suffix words so 'Altaria ex' → 'altaria'."""
             return _re.sub(r'\s+(ex|v|vmax|vstar|gx)\s*$', '', name.lower()).strip()
 
+        def _normalize(text: str) -> str:
+            return _re.sub(r'[^a-z0-9]+', ' ', text.lower()).strip()
+
         def _name_score(card_name: str) -> int:
             """Lower = better match. -1 means no match."""
-            base = _base(card_name)
-            full = card_name.lower()
-            pos = arch_name_lower.find(base)
-            if pos == -1:
-                pos = arch_name_lower.find(full)
-            return pos  # -1 if not found, else index (earlier = higher priority)
+            base = _normalize(_base(card_name))
+            full = _normalize(card_name)
+            match = None
+            if base:
+                match = _re.search(rf'\b{_re.escape(base)}\b', arch_name_lower)
+            if match:
+                return match.start()
+            if full:
+                match = _re.search(rf'\b{_re.escape(full)}\b', arch_name_lower)
+            return match.start() if match else -1
+
+        known_names = [catalog[entry["id"]].name for entry in arch.get("cards", []) if entry["id"] in catalog]
+        missing_names = _guess_missing_card_names(arch.get("name", ""), known_names)
+        missing_iter = iter(missing_names)
 
         named: list[tuple[int, int, str]] = []   # (position, hp, url)
         by_hp: list[tuple[int, str]] = []
+        unknown_urls: list[str] = []
 
         for entry in arch.get("cards", []):
-            card = catalog.get(entry["id"])
-            if not card or not card.is_pokemon:
-                continue
             url = _card_image_url(entry["id"])
+            card = catalog.get(entry["id"])
+            if card is None:
+                fallback_name = next(missing_iter, entry["id"])
+                score = _name_score(fallback_name)
+                if score >= 0:
+                    named.append((score, 0, url))
+                else:
+                    unknown_urls.append(url)
+                continue
+            if not card.is_pokemon:
+                continue
             score = _name_score(card.name)
             if score >= 0:
                 named.append((score, -(card.hp or 0), url))
@@ -132,6 +182,14 @@ def _prepare_page_data(
         # Sort named by position in deck name (earliest first)
         named.sort(key=lambda x: (x[0], x[1]))
         result = list(dict.fromkeys(u for _, _, u in named))[:2]
+
+        # Prefer missing catalog card URLs before HP fallbacks.
+        if len(result) < 2:
+            for url in unknown_urls:
+                if url not in result:
+                    result.append(url)
+                if len(result) == 2:
+                    break
 
         # Fill remaining slots with highest-HP Pokémon
         if len(result) < 2:
@@ -172,28 +230,33 @@ def _prepare_page_data(
     collection = Collection(cards=my_cards)
     analysis_data = []
     for deck, ewr, attr in zip(meta_decks, ewrs, attributions):
-        completion = collection.completion_percent(deck)
-        missing = collection.missing_cards(deck)
-        top_role = max(attr, key=lambda r: attr[r]) if attr else "N/A"  # noqa: B023
-        analysis_data.append({
-            "name": deck.archetype_label,
-            "completion": completion,
-            "ewr": round(ewr * 100, 1),
-            "top_role": top_role,
-            "attribution": {r: round(attr.get(r, 0) * 100, 2) for r in _ROLES},
-            "predicted_wr": round(
-                (sum(attr.values()) + (regression.intercept if regression else 0)) * 100, 1
-            ),
-            "missing": [
-                {
-                    "name": c.name,
-                    "count": n,
-                    "role": role_map.get(c.id, "garnet") if role_map else "garnet",
-                }
-                for c, n in missing
-            ],
-            "total_missing": len(missing),
-        })
+      completion = collection.completion_percent(deck)
+      missing = collection.missing_cards(deck)
+      completion_by_name = collection.completion_percent_by_name(deck)
+      missing_by_name = collection.missing_cards_by_name(deck)
+      top_role = max(attr, key=lambda r: attr[r]) if attr else "N/A"  # noqa: B023
+      analysis_data.append({
+        "id": deck.archetype_id,
+        "name": deck.archetype_label,
+        "completion": completion,
+      "completion_by_name": completion_by_name,
+        "ewr": round(ewr * 100, 1),
+        "top_role": top_role,
+        "attribution": {r: round(attr.get(r, 0) * 100, 2) for r in _ROLES},
+        "predicted_wr": round(
+          (sum(attr.values()) + (regression.intercept if regression else 0)) * 100, 1
+        ),
+        "missing": [
+          {
+            "name": c.name,
+            "count": n,
+            "role": role_map.get(c.id, "garnet") if role_map else "garnet",
+          }
+          for c, n in missing
+        ],
+        "missing_by_name": [{"name": n, "count": c} for n, c in missing_by_name],
+        "total_missing": len(missing),
+      })
     analysis_data.sort(key=lambda r: r["completion"], reverse=True)
 
     # ── CATALOG tab ──────────────────────────────────────────────────────────
@@ -404,6 +467,37 @@ def _build_html(page_data: dict, my_cards: dict) -> str:  # noqa: E501
     transition: box-shadow .1s, transform .1s; animation: slideIn .3s ease;
   }}
   .arch-card:hover {{ box-shadow: var(--shadow-lg); transform: translate(-4px,-4px); }}
+  .arch-hover-overlay {{
+    position: absolute; inset: 0; background: rgba(10,10,10,0.92); display: flex; flex-direction: column;
+    align-items: center; justify-content: flex-start; gap: 12px; padding: 16px; text-align: center;
+    opacity: 0; visibility: hidden; transition: opacity 0.15s ease, visibility 0.15s ease; z-index: 100;
+    overflow-y: auto; max-height: 100%;
+  }}
+  .arch-card:hover .arch-hover-overlay {{ opacity: 1; visibility: visible; }}
+  .arch-hover-title {{
+    font-family: var(--font); font-size: 14px; font-weight: 700; color: #fff;
+    word-break: break-word; line-height: 1.3; flex-shrink: 0;
+  }}
+  .arch-hover-cards {{
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(70px, 1fr)); gap: 8px; width: 100%;
+    flex: 1; overflow-y: auto; padding: 8px 0;
+  }}
+  .arch-hover-cards::-webkit-scrollbar {{ width: 4px; }}
+  .arch-hover-cards::-webkit-scrollbar-thumb {{ background: rgba(255,255,255,0.3); border-radius: 2px; }}
+  .meta-card-item {{
+    display: flex; flex-direction: column; align-items: center; gap: 4px; font-size: 11px; color: #fff;
+  }}
+  .meta-card-thumb {{
+    width: 60px; height: 80px; background: var(--panel); border: 2px solid rgba(255,255,255,0.2);
+    object-fit: contain; display: flex; align-items: center; justify-content: center;
+  }}
+  .meta-card-name {{
+    font-family: var(--mono); font-size: 10px; color: #ccc; line-height: 1.2; word-break: break-word;
+    max-width: 70px; overflow: hidden; text-overflow: ellipsis; display: -webkit-box; -webkit-line-clamp: 2;
+  }}
+  .meta-card-count {{
+    font-family: var(--pixel); font-size: 9px; color: var(--gold); font-weight: 700;
+  }}
   .arch-img-area {{
     height: 220px; background: var(--panel); border-bottom: 4px solid var(--border);
     display: flex; align-items: center; justify-content: center;
@@ -584,7 +678,7 @@ def _build_html(page_data: dict, my_cards: dict) -> str:  # noqa: E501
   .an-sc-hand-card.hc-left  {{ z-index: 1; }}
   .an-sc-hand-card.hc-mid   {{ z-index: 3; }}
   .an-sc-hand-card.hc-right {{ z-index: 1; }}
-  .an-sc-hand-blank {{
+  .an-sc-blank {{
     width: 100%; height: 100%; display: flex; align-items: center; justify-content: center;
     font-size: 28px; color: var(--dim); background: var(--bg-deep);
   }}
@@ -1094,6 +1188,24 @@ def _build_html(page_data: dict, my_cards: dict) -> str:  # noqa: E501
     background: var(--panel); padding: 4px; margin-top: 4px;
   }}
   #boot-bar {{ height: 100%; width: 0%; background: var(--border); transition: width .05s linear; }}
+
+  /* Tooltip for aggregate toggle */
+  .agg-tooltip {{
+    position: relative; display: inline-block; margin-left: 6px; cursor: help; color: var(--dim);
+    font-weight: 600; width: 18px; height: 18px; line-height: 18px; text-align: center; border-radius: 3px;
+    background: rgba(0,0,0,0.04);
+  }}
+  .agg-tooltip .agg-tooltip-text {{
+    visibility: hidden; opacity: 0; width: 260px; background-color: #111; color: #fff; text-align: left;
+    border-radius: 6px; padding: 8px; position: absolute; z-index: 1000; bottom: 125%; left: 50%; transform: translateX(-50%);
+    transition: opacity 0.15s ease, visibility 0.15s ease; font-family: var(--mono); font-size: 12px; line-height: 1.2;
+  }}
+  .agg-tooltip .agg-tooltip-text::after {{
+    content: ""; position: absolute; top: 100%; left: 50%; transform: translateX(-50%); border-width: 6px; border-style: solid;
+    border-color: #111 transparent transparent transparent;
+  }}
+  .agg-tooltip:hover .agg-tooltip-text {{ visibility: visible; opacity: 1; }}
+
 </style>
 </head>
 <body>
@@ -1283,6 +1395,7 @@ let   REGRESSION    = {regression_json};
 let   collection    = {collection_json};
 let   activeDeckIdx = -1;
 let   activeTab     = 'meta';
+let   aggregateByName = (localStorage.getItem('aggByName') === '1');
 
 // Catalog state
 let catFiltered = [];
@@ -1307,6 +1420,12 @@ function showTab(name) {{
   setStatus('', '');
 }}
 
+function anToggleAggregate() {{
+  aggregateByName = document.getElementById('agg-toggle').checked;
+  localStorage.setItem('aggByName', aggregateByName ? '1' : '0');
+  renderAnalysis();
+}}
+
 // ── META tab ────────────────────────────────────────────────────────────────
 function renderMeta() {{
   const grid = document.getElementById('meta-grid');
@@ -1317,6 +1436,18 @@ function renderMeta() {{
     const imgHtml = imgs.length
       ? imgs.map(u => `<img src="${{u}}" alt="${{arch.name}}" onerror="this.style.display='none'">`).join('')
       : `<span style="font-size:56px">🃏</span>`;
+    
+    // Find the full deck in ARCHETYPES to get all cards
+    const fullDeck = ARCHETYPES.find(d => d.id === arch.id);
+    const cardGridHtml = fullDeck && fullDeck.cards && fullDeck.cards.length
+      ? fullDeck.cards.map(c => `
+          <div class="meta-card-item">
+            ${{c.img ? `<img src="${{c.img}}" alt="${{c.name}}" class="meta-card-thumb" onerror="this.style.display='none'">` : `<div class="meta-card-thumb" style="background:var(--panel)"></div>`}}
+            <div class="meta-card-name">${{c.name}}</div>
+            <div class="meta-card-count">×${{c.need}}</div>
+          </div>`).join('')
+      : '';
+    
     const areaCls = imgs.length === 1 ? 'arch-img-area single' : 'arch-img-area';
     const div = document.createElement('div');
     div.className = 'arch-card';
@@ -1334,6 +1465,10 @@ function renderMeta() {{
             E[WR] <span class="${{ewrCls}}">${{arch.ewr}}%</span>
           </div>
         </div>
+      </div>
+      <div class="arch-hover-overlay">
+        <div class="arch-hover-title">${{arch.name}}</div>
+        <div class="arch-hover-cards">${{cardGridHtml}}</div>
       </div>`;
     grid.appendChild(div);
   }});
@@ -1428,7 +1563,7 @@ function renderCards(deck) {{
 function adjust(cardId, need, delta) {{
   const next = Math.max(0, Math.min((collection[cardId] || 0) + delta, 4));
   collection[cardId] = next;
-  const safe = cardId.replace(/[^a-z0-9]/gi,'_');
+  const safe = cardId.replace(/[^a-z0-9]/gi, '_');
   const el = document.getElementById('cnt-' + safe);
   if (el) el.textContent = next;
   const cardEl = document.getElementById('card-' + safe);
@@ -1478,19 +1613,27 @@ function anVerdictInfo(wr) {{
 }}
 
 function anTop3Cards(deck) {{
-  // Return up to 3 unique Pokémon cards.
-  // Priority: 1) name appears in deck name, 2) role priority (win_condition first)
+  // Return up to 3 unique Pokémon cards from the deck.
+  // Priority: 1) name position in deck name, 2) role priority (win_condition first)
   const deckNameLower = (deck.name || deck.id || '').toLowerCase();
+  const normalizedDeckName = deckNameLower.replace(/[^a-z0-9]+/g, ' ');
   const seen = {{}};
   const unique = [];
   for (const c of (deck.cards || [])) {{
     if (!seen[c.id] && c.type === 'Pokemon') {{ seen[c.id] = true; unique.push(c); }}
   }}
-  // Score: named match = 0, then by role order
+  const titleIndex = (card) => {{
+    if (!normalizedDeckName || !card.name) return Number.MAX_SAFE_INTEGER;
+    const normalized = card.name.toLowerCase().replace(/ ex$/i, '').replace(/ v$/i, '').replace(/[^a-z0-9]+/g, ' ').trim();
+    if (!normalized) return Number.MAX_SAFE_INTEGER;
+    const regex = new RegExp(`\\b${{normalized.replace(/[.*+?^${{}}()|[\\]\\\\]/g, '\\\\\\\\$&')}}\\b`);
+    const match = normalizedDeckName.match(regex);
+    return match ? match.index : Number.MAX_SAFE_INTEGER;
+  }};
   unique.sort((a, b) => {{
-    const aName = deckNameLower && a.name && deckNameLower.includes(a.name.toLowerCase().replace(/ ex$/i,'').replace(/ v$/i,'').trim()) ? 0 : 1;
-    const bName = deckNameLower && b.name && deckNameLower.includes(b.name.toLowerCase().replace(/ ex$/i,'').replace(/ v$/i,'').trim()) ? 0 : 1;
-    if (aName !== bName) return aName - bName;
+    const aPos = titleIndex(a);
+    const bPos = titleIndex(b);
+    if (aPos !== bPos) return aPos - bPos;
     return (ROLE_ORDER[a.role] ?? 4) - (ROLE_ORDER[b.role] ?? 4);
   }});
   return unique.slice(0, 3);
@@ -1498,13 +1641,13 @@ function anTop3Cards(deck) {{
 
 function anHandHtml(deck) {{
   const cards = anTop3Cards(deck);
-  if (!cards.length) return '<div class="an-sc-hand-blank">🃏</div>';
+  if (!cards.length) return '<div class="an-sc-blank">🃏</div>';
   return `<div class="an-sc-hand">${{
     cards.map(c => `
       <div class="an-sc-hand-card">
         ${{c.img
-          ? `<img src="${{c.img}}" alt="${{c.name}}" onerror="this.parentNode.innerHTML='<div class=\\'an-sc-hand-blank\\'>🃏</div>'">`
-          : `<div class="an-sc-hand-blank">🃏</div>`
+          ? `<img src="${{c.img}}" alt="${{c.name}}" onerror="this.parentNode.innerHTML='<div class=\\'an-sc-blank\\'>🃏</div>'">`
+          : `<div class="an-sc-blank">🃏</div>`
         }}
       </div>`).join('')
   }}</div>`;
@@ -1668,30 +1811,47 @@ function anRenderRoot() {{
     </div>`;
   }}).join('');
 
-  // Missing cards filtered by role
-  const seen2 = {{}};
-  const allMissing = [];
-  for (const c of yourDeck.cards) {{
-    if (seen2[c.id]) continue; seen2[c.id] = true;
-    const short = c.need - (collection[c.id] || 0);
-    if (short > 0) allMissing.push({{ name: c.name, count: short, role: c.role || 'garnet', id: c.id, img: c.img || '' }});
+  // All unique cards in the deck with owned/need counts
+  const allCards = [];
+  if (aggregateByName) {{
+    const nameMap = {{}};
+    for (const c of yourDeck.cards) {{
+      const base = c.name.replace(/\s+(ex|v|vmax|vstar|gx)\s*$/i, '').trim() || c.name;
+      if (!nameMap[base]) {{
+        nameMap[base] = {{ name: base, need: 0, owned: 0, role: c.role || 'garnet', id: c.id, img: c.img || '' }};
+      }}
+      const prev = nameMap[base];
+      prev.need += c.need;
+      prev.owned = Math.min(prev.owned + Math.min(collection[c.id] || 0, c.need), prev.need);
+    }}
+    allCards.push(...Object.values(nameMap));
+  }} else {{
+    const seen2 = {{}};
+    for (const c of yourDeck.cards) {{
+      if (seen2[c.id]) continue; seen2[c.id] = true;
+      const owned = Math.min(collection[c.id] || 0, c.need);
+      allCards.push({{ name: c.name, need: c.need, owned, role: c.role || 'garnet', id: c.id, img: c.img || '' }});
+    }}
   }}
-  allMissing.sort((a, b) => (ROLE_ORDER[a.role] ?? 4) - (ROLE_ORDER[b.role] ?? 4));
-  const visibleMissing = anRoleFilter ? allMissing.filter(m => m.role === anRoleFilter) : allMissing;
+  allCards.sort((a, b) => (ROLE_ORDER[a.role] ?? 4) - (ROLE_ORDER[b.role] ?? 4));
+  const allMissing = allCards.filter(c => c.owned < c.need);
+  const totalMissingCount = allMissing.length;
+  const visibleCards = anRoleFilter ? allCards.filter(c => c.role === anRoleFilter) : allCards;
 
-  const cardListHtml = visibleMissing.length
-    ? `<div class="an-acq-grid">${{visibleMissing.map(m => `
-        <div class="an-acq-item">
-          ${{m.img ? `<img class="an-acq-thumb" src="${{m.img}}" onerror="this.style.display='none'" alt="${{m.name}}">` : `<div class="an-acq-thumb"></div>`}}
+  const cardListHtml = visibleCards.length
+    ? `<div class="an-acq-grid">${{visibleCards.map(c => {{
+        const isFull = c.owned >= c.need;
+        const countColor = isFull ? 'var(--green)' : 'var(--red)';
+        return `<div class="an-acq-item">
+          ${{c.img ? `<img class="an-acq-thumb" src="${{c.img}}" onerror="this.style.display='none'" alt="${{c.name}}">` : `<div class="an-acq-thumb"></div>`}}
           <div style="flex:1;min-width:0">
-            <span class="an-role-badge role-${{m.role}}" style="background:${{ROLE_COLOR[m.role]}}">${{ROLE_LABEL[m.role]}}</span>
-            <div class="an-acq-name">${{m.name}}</div>
+            <span class="an-role-badge role-${{c.role}}" style="background:${{ROLE_COLOR[c.role]}}">${{ROLE_LABEL[c.role]}}</span>
+            <div class="an-acq-name">${{c.name}}</div>
           </div>
-          <span class="an-acq-count">×${{m.count}}</span>
-        </div>`).join('')}}</div>`
-    : (allMissing.length === 0
-        ? `<div class="an-acq-empty">✓ NO MISSING CARDS · 揃っています</div>`
-        : `<div class="an-acq-empty">✓ NO MISSING ${{ROLE_LABEL[anRoleFilter]}} CARDS</div>`);
+          <span class="an-acq-count" style="color:${{countColor}}">${{c.owned}}/${{c.need}}</span>
+        </div>`;
+      }}).join('')}}</div>`
+    : `<div class="an-acq-empty">${{anRoleFilter ? `NO ${{ROLE_LABEL[anRoleFilter]}} CARDS IN THIS DECK` : 'NO CARD DATA'}}</div>`;
 
   const filterBadge = anRoleFilter
     ? `<span class="an-filter-badge">${{ROLE_LABEL[anRoleFilter]}}</span>` : '';
@@ -1843,6 +2003,12 @@ function anRenderRoot() {{
       <div class="an-nav-right">
         <div style="color:var(--green)">FAVORABLE ${{favStr}}</div>
         <div>WEIGHTED WR ${{wwrStr}}</div>
+        <label style="margin-left:12px;display:flex;align-items:center;font-size:12px;color:var(--dim)">
+          <input id="agg-toggle" type="checkbox" onchange="anToggleAggregate()" style="margin-right:6px" ${{aggregateByName ? 'checked' : ''}}>Aggregate by name
+          <span class="agg-tooltip" aria-hidden="true">?
+            <span class="agg-tooltip-text">When enabled, analysis aggregates cards by base Pokémon name (strips suffixes like ex/v/vmax) and groups by Pokémon name instead of exact card IDs. Useful when you want an aggregated collection completion view across variants.</span>
+          </span>
+        </label>
       </div>
     </div>
 
@@ -1874,7 +2040,7 @@ function anRenderRoot() {{
         <span class="an-panel-subtitle">差を埋めよ</span>
         ${{roleRowsHtml}}
         <div class="an-card-list-header">
-          <div class="an-card-list-title">CARDS TO ACQUIRE ${{allMissing.length ? '(' + allMissing.length + ')' : ''}}</div>
+          <div class="an-card-list-title">DECK LIST (${{allCards.length}})${{totalMissingCount ? ` · <span style="color:var(--red)">${{totalMissingCount}} MISSING</span>` : ' · <span style="color:var(--green)">✓ COMPLETE</span>'}}</div>
           ${{filterBadge}}
           ${{anRoleFilter ? `<button class="an-clear-btn" onclick="anToggleRole(null)">✕ CLEAR</button>` : ''}}
         </div>
