@@ -905,18 +905,18 @@ def _build_html(page_data: dict, my_cards: dict) -> str:  # noqa: E501
   .an-picker-card.selected {{ border-color: var(--pink); box-shadow: 4px 4px 0 0 var(--pink); }}
   /* mini 3-card fan inside each picker card */
   .an-picker-hand {{
-    width: 100%; height: 90px;
+    width: 100%; height: 75px;
     display: flex; align-items: flex-end; justify-content: center;
     overflow: hidden; position: relative;
   }}
   .an-picker-hcard {{
-    width: 52px; height: 73px; flex-shrink: 0;
+    width: 42px; height: 59px; flex-shrink: 0;
     border: 1px solid var(--border); overflow: hidden; background: var(--panel);
   }}
   .an-picker-hcard img {{ width: 100%; height: 100%; object-fit: cover; display: block; }}
-  .an-picker-hcard.hc-left  {{ transform: rotate(-6deg) translateY(8px); margin-right: -8px; z-index: 1; }}
+  .an-picker-hcard.hc-left  {{ transform: rotate(-6deg) translateY(6px); margin-right: -12px; z-index: 1; }}
   .an-picker-hcard.hc-mid   {{ z-index: 3; }}
-  .an-picker-hcard.hc-right {{ transform: rotate(6deg) translateY(8px); margin-left: -8px; z-index: 1; }}
+  .an-picker-hcard.hc-right {{ transform: rotate(6deg) translateY(6px); margin-left: -12px; z-index: 1; }}
   .an-picker-name {{ font-family: var(--font); font-size: 13px; text-align: center; line-height: 1.3; }}
   .an-picker-meta {{ font-family: var(--pixel); font-size: 9px; color: var(--pink); }}
 
