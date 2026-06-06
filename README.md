@@ -300,6 +300,18 @@ python main_cli.py
 
 ---
 
+## Team & Contributions
+
+| Member | Deliverable |
+|---|---|
+| **Jofer Santiago** | Data Pipeline & API Integration — fetching and caching tournament data from Limitless TCG API and card catalog from GitHub |
+| **Deborah Argayosa** | Core Analysis Engine — expected win rate calculation, card role classification, and regression model |
+| **John Rudolph Navarro** | Browser UI — full web interface with all 7 tabs (Meta, Collection, Decks, Analysis, Matchup, Catalog, New Deck) |
+| **King Herald Monteroyo** | Python CLI — terminal version with all 4 tabs, CSV import, and random collection generator |
+| **Stefanie Joy Rosete** | Testing & Documentation — test suite (79 tests), README, and project documentation |
+
+---
+
 ## Data Sources
 
 - **Card Catalog** — [flibustier/pokemon-tcg-pocket-database](https://github.com/flibustier/pokemon-tcg-pocket-database) on GitHub
